@@ -23,7 +23,7 @@ constexpr const char* LOCAL_CLIENT_ID = "cottage_gateway_local";
 constexpr const char* MAIN_CLIENT_ID = "cottage_gateway_remote";
 
 constexpr const char* LOCAL_SUBSCRIPTION = "#";
-constexpr const char* MAIN_COMMAND_SUBSCRIPTION = "cmnd/#";
+constexpr const char* MAIN_COMMAND_SUBSCRIPTION = "#";
 constexpr const char* GATEWAY_AVAILABILITY_TOPIC = "cottage/gateway/availability";
 
 constexpr uint16_t MAX_TOPIC_LENGTH = 128;
@@ -34,3 +34,10 @@ constexpr unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000;
 
 // Встроенный светодиод на большинстве плат ESP32 (NodeMCU / DevKit) — это GPIO 2
 constexpr int LED_PIN = 2;
+
+constexpr const char* DEFAULT_MAX_TOKEN = "";
+constexpr const char* DEFAULT_MAX_USER_ID = "";
+
+// Шаг 10 минут (600000 мс), храним 144 точки (24 часа)
+constexpr unsigned long HISTORY_INTERVAL_MS = 600000UL; 
+constexpr size_t MAX_HISTORY_POINTS = 144;

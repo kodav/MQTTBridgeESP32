@@ -4,6 +4,9 @@
 #include <EmbeddedMqttBroker.h>
 #include <ArduinoJson.h>
 
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -44,6 +47,11 @@ std::vector<CachedState> stateCache;
 // Только имена топиков, необходимых виджетам.
 std::vector<String> favoriteTopics;
 
+// Очередь ожидающих отправки сообщений в MAX (защита от переполнения RAM — максимум 10 штук)
+std::vector<String> pendingAlerts;
+constexpr size_t MAX_PENDING_ALERTS = 10;
+unsigned long lastAlertProcessTime = 0;
+
 // Последняя обработанная конфигурация виджетов.
 String lastWidgetsJson;
 bool widgetsLoaded = false;
@@ -57,6 +65,39 @@ bool servicesStarted = false;
 
 unsigned long lastLocalReconnectAttempt = 0;
 unsigned long lastMainReconnectAttempt = 0;
+bool lastMainMqttStatus = false;
+
+// Структура для отслеживания предыдущих значений (защита от спама и повторов)
+struct LastAlertState {
+    String topic;
+    float lastValue = 0;
+    bool hasValue = false;
+    unsigned long lastSentTime = 0;
+};
+std::vector<LastAlertState> alertStates;
+
+LastAlertState* findAlertState(const String& topic) {
+    for (auto& st : alertStates) {
+        if (st.topic == topic) return &st;
+    }
+    return nullptr;
+}
+
+struct RuleAlertState {
+    String topic;
+    int ruleIndex;
+    float lastValue = 0;
+    bool hasValue = false;
+    unsigned long lastSentTime = 0;
+};
+std::vector<RuleAlertState> ruleAlertStates;
+
+RuleAlertState* findRuleAlertState(const String& topic, int ruleIndex) {
+    for (auto& st : ruleAlertStates) {
+        if (st.topic == topic && st.ruleIndex == ruleIndex) return &st;
+    }
+    return nullptr;
+}
 
 // ============================================================
 // Вспомогательные функции
@@ -207,6 +248,104 @@ void refreshFavoriteTopics() {
 // Кэш состояний
 // ============================================================
 
+// Проверка и отправка оповещений в MAX для избранных топиков
+void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int length) {
+    SystemSettings s = Settings::get();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, s.widgetsJson);
+    if (err || !doc.is<JsonArray>()) return;
+
+    String payloadStr = "";
+    for (unsigned int i = 0; i < length; ++i) payloadStr += (char)payload[i];
+
+    for (JsonObject w : doc.as<JsonArray>()) {
+        String wTopic = w["topic"].as<String>();
+        String baseTopic = wTopic;
+        if (baseTopic.indexOf('#') >= 0) {
+            baseTopic = baseTopic.substring(0, baseTopic.indexOf('#'));
+            baseTopic.trim();
+        }
+
+        if (strcmp(topic, baseTopic.c_str()) != 0) continue;
+
+        JsonArray alerts = w["alerts"].as<JsonArray>();
+        if (alerts.isNull()) continue;
+
+        String valToEval = payloadStr;
+        if (wTopic.indexOf('#') >= 0) {
+            String jsonKey = wTopic.substring(wTopic.indexOf('#') + 1);
+            jsonKey.trim();
+            JsonDocument jsonDoc;
+            if (!deserializeJson(jsonDoc, payloadStr)) {
+                if (jsonDoc[jsonKey].is<JsonVariant>()) {
+                    valToEval = jsonDoc[jsonKey].as<String>();
+                }
+            }
+        }
+
+        float currentVal = valToEval.toFloat();
+
+        int ruleIdx = 0;
+        for (JsonObject alert : alerts) {
+            String alertCond = alert["cond"] | "none";
+            if (alertCond == "none" || !alert["msg"].is<String>()) {
+                ruleIdx++;
+                continue;
+            }
+
+            float thresholdVal = alert["val"] | 0.0f;
+            float thresholdMax = alert["valMax"] | 0.0f;
+            String alertMsg = alert["msg"].as<String>();
+
+            RuleAlertState* ast = findRuleAlertState(topic, ruleIdx);
+            if (!ast) {
+                RuleAlertState newAst;
+                newAst.topic = topic;
+                newAst.ruleIndex = ruleIdx;
+                newAst.lastValue = currentVal;
+                newAst.hasValue = true;
+                newAst.lastSentTime = 0;
+                ruleAlertStates.push_back(newAst);
+                ast = &ruleAlertStates.back();
+            }
+
+            bool trigger = false;
+            unsigned long now = millis();
+            bool cooldownOk = (now - ast->lastSentTime > 60000UL || ast->lastSentTime == 0);
+
+            if (cooldownOk) {
+                if (alertCond == "change" && ast->hasValue && valToEval != String(ast->lastValue)) {
+                    trigger = true;
+                } else if (alertCond == "below" && currentVal < thresholdVal && (ast->lastValue >= thresholdVal || !ast->hasValue)) {
+                    trigger = true;
+                } else if (alertCond == "above" && currentVal > thresholdVal && (ast->lastValue <= thresholdVal || !ast->hasValue)) {
+                    trigger = true;
+                } else if (alertCond == "between") {
+                    bool isInside = (currentVal >= thresholdVal && currentVal <= thresholdMax);
+                    bool wasInside = (ast->hasValue && ast->lastValue >= thresholdVal && ast->lastValue <= thresholdMax);
+                    if (isInside && (!wasInside || !ast->hasValue)) {
+                        trigger = true;
+                    }
+                }
+
+                if (trigger) {
+                    Serial.printf("[MAX ALERT] Правило #%d для %s сработало. Отправка...\n", ruleIdx, topic);
+                    if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
+                        pendingAlerts.push_back(alertMsg);
+                    }
+                    ast->lastSentTime = now;
+                }
+            }
+
+            ast->lastValue = currentVal;
+            ast->hasValue = true;
+            ruleIdx++;
+        }
+        break;
+    }
+}
+
+// Объединенная функция сохранения в кэш
 bool saveStateToCache(
     const char* topic,
     const byte* payload,
@@ -264,6 +403,22 @@ bool saveStateToCache(
 
     state->payload[length] = '\0';
     state->updatedAt = millis();
+
+     // Запись точки в историю для графиков (раз в 30 минут = 1800000 мс)
+    String payloadStr = "";
+    for (unsigned int i = 0; i < length; ++i) payloadStr += (char)payload[i];
+    float currentVal = payloadStr.toFloat();
+    unsigned long now = millis();
+
+    if (state->history.empty() || (now - state->history.back().timestamp >= HISTORY_INTERVAL_MS)) {
+        if (state->history.size() >= MAX_HISTORY_POINTS) {
+            state->history.erase(state->history.begin());
+        }
+        state->history.push_back({currentVal, now});
+    }
+
+    // Проверяем условия и отправляем оповещение MAX
+    checkAndSendMaxAlert(topic, payload, length);
 
     return true;
 }
@@ -348,13 +503,10 @@ void onLocalMqttMessage(
     saveStateToCache(topic, payload, length);
 }
 
-void onMainMqttMessage(
-    char* topic,
-    byte* payload,
-    unsigned int length
-) {
-    // Текущая настройка принимает команды Tasmota.
-    if (!startsWith(topic, "cmnd/")) {
+void onMainMqttMessage(char* topic, byte* payload, unsigned int length) {
+    // Пропускаем все телеметрические статусы и state, оставляем только команды
+    String t = String(topic);
+    if (!t.startsWith("cmnd/") && !t.endsWith("/command") && !t.endsWith("/set")) {
         return;
     }
 
@@ -730,11 +882,88 @@ void setup() {
         "[WIFI] Подключён. IP: %s\n",
         WiFi.localIP().toString().c_str()
     );
+    // Отправка уведомления о старте шлюза (только один раз за загрузку)
+    if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
+        pendingAlerts.push_back("🟢 MQTT Bridge online");
+        Serial.println("[MAX ALERT] Стартовое уведомление добавлено в очередь.");
+    }
+}
+
+void processPendingAlerts() {
+    if (pendingAlerts.empty()) {
+        return;
+    }
+
+    unsigned long now = millis();
+    // Отправляем не чаще чем раз в 3 секунды, чтобы не перегружать сетевой стек и Wi-Fi
+    if (now - lastAlertProcessTime > 3000UL) {
+        lastAlertProcessTime = now;
+        
+        // Берем первое сообщение из очереди
+        String msg = pendingAlerts.front();
+        pendingAlerts.erase(pendingAlerts.begin());
+
+        // Выполняем HTTPS-запрос в фоне (вне MQTT callback)
+        sendMaxNotification(msg);
+    }
+}
+
+bool sendMaxNotification(const String& message) {
+    SystemSettings s = Settings::get();
+    if (s.maxToken.length() == 0 || s.maxUserId.length() == 0) {
+        Serial.println("[MAX] Токен или User ID не настроены");
+        return false;
+    }
+
+    if (ESP.getFreeHeap() < 40000) {
+        Serial.println("[MAX] Слишком мало памяти для безопасного соединения, пропуск отправки.");
+        return false;
+    }
+
+    bool success = false;
+
+    // Локальный блок видимости: вся SSL-память выделяется при входе 
+    // и гарантированно полностью освобождается при выходе из скобок { }
+    {
+        WiFiClientSecure secureClient;
+        secureClient.setInsecure(); // Пропуск проверки сертификата
+
+        HTTPClient https;
+        String url = "https://platform-api.max.ru/messages?user_id=" + s.maxUserId;
+
+        Serial.printf("[MAX] Отправка запроса (свободно RAM: %u)...\n", ESP.getFreeHeap());
+
+        if (https.begin(secureClient, url)) {
+            https.addHeader("Authorization", s.maxToken);
+            https.addHeader("Content-Type", "application/json");
+
+            JsonDocument doc;
+            doc["text"] = message;
+            String payload;
+            serializeJson(doc, payload);
+
+            int httpCode = https.POST(payload);
+            success = (httpCode > 0 && httpCode == 200);
+
+            if (success) {
+                Serial.println("[MAX] Сообщение успешно отправлено!");
+            } else {
+                Serial.printf("[MAX] Ошибка отправки! HTTP код: %d\n", httpCode);
+            }
+
+            https.end();
+        } else {
+            Serial.println("[MAX] Не удалось инициализировать HTTPS-клиент");
+        }
+    } // Деструктор WiFiClientSecure очищает heap-память здесь
+
+    return success;
 }
 
 void loop() {
     // Индикатор работает также при отсутствии Wi-Fi и в режиме AP.
     updateLedIndicator();
+    processPendingAlerts(); // Фоновая отправка оповещений MAX без блокировки MQTT
 
     if (isApMode) {
         // Это необходимо, даже когда WiFi.status() не WL_CONNECTED.
@@ -770,6 +999,28 @@ void loop() {
     } else {
         mainMqtt.loop();
     }
+
+    // Отслеживание изменения статуса главного MQTT-брокера
+    bool currentMainStatus = mainMqtt.connected();
+    if (currentMainStatus != lastMainMqttStatus) {
+        lastMainMqttStatus = currentMainStatus;
+        
+        if (currentMainStatus) {
+            // Связь восстановилась
+            Serial.println("[MAX ALERT] Главный MQTT-сервер: связь восстановлена!");
+            if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
+                pendingAlerts.push_back("🟢 Связь с главным MQTT-сервером восстановлена!");
+            }
+        } else {
+            // Связь потеряна (и если шлюз до этого был успешно запущен в сети Wi-Fi)
+            if (WiFi.status() == WL_CONNECTED && servicesStarted) {
+                Serial.println("[MAX ALERT] Главный MQTT-сервер: связь потеряна!");
+                if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
+                    pendingAlerts.push_back("🔴 Внимание: потеряна связь с главным MQTT-сервером!");
+                }
+            }
+        }
+    }    
 
     delay(5);
 }

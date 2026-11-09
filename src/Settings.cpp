@@ -32,6 +32,9 @@ void init() {
     // Загружаем сохраненные виджеты дашборда
     currentSettings.widgetsJson = preferences.getString("widgets", "[]");
 
+    currentSettings.maxToken = preferences.getString("max_token", DEFAULT_MAX_TOKEN);
+    currentSettings.maxUserId = preferences.getString("max_userid", DEFAULT_MAX_USER_ID);
+
     preferences.end();
 }
 
@@ -67,6 +70,17 @@ void saveWidgets(const String& widgetsJson) {
     preferences.putString("widgets", widgetsJson);
     preferences.end();
     currentSettings.widgetsJson = widgetsJson;
+}
+
+
+// Новая функция сохранения настроек MAX:
+void saveMax(const String& token, const String& userId) {
+    preferences.begin("gateway", false);
+    preferences.putString("max_token", token);
+    preferences.putString("max_userid", userId);
+    preferences.end();
+    currentSettings.maxToken = token;
+    currentSettings.maxUserId = userId;
 }
 
 } // namespace Settings

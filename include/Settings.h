@@ -16,6 +16,9 @@ struct SystemSettings {
 
     // Данные виджетов, загруженные из Preferences
     String widgetsJson;
+
+    String maxToken;
+    String maxUserId; // ID пользователя в MAX
 };
 
 namespace Settings {
@@ -26,4 +29,6 @@ namespace Settings {
 
     // Доступ к JSON виджетов без копирования всей структуры
     const String& widgetsJson();
+
+    void saveMax(const String& token, const String& userId);
 }

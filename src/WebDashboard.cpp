@@ -39,7 +39,7 @@ const char SETUP_HTML[] PROGMEM = R"HTML(
 </head>
 <body>
 <div class="panel">
-    <h2>Настройка шлюза дачи</h2>
+    <h2>Настройка шлюза</h2>
     <form id="settingsForm">
         <label>Имя Wi-Fi сети (SSID)</label><input id="setSsid" required>
         <label>Пароль Wi-Fi</label><input id="setPass" type="password">
@@ -79,7 +79,6 @@ document.getElementById("settingsForm").addEventListener("submit", async functio
         setTimeout(() => location.reload(), 4000);
     } catch(err) { res.textContent = "Ошибка: " + err; res.className = "error"; }
 });
-loadSettings();
 </script>
 </body>
 </html>
@@ -154,6 +153,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
         <button type="button" class="tab-button" data-tab="control">Управление</button>
         <button type="button" class="tab-button" data-tab="settings">Настройки</button>
         <button type="button" class="tab-button" data-tab="dashconfig">⚙️ Настройка дашборда</button>
+        <button type="button" class="tab-button" data-tab="max">📢 MAX</button>
     </nav>
 
     <!-- Дашборд -->
@@ -254,6 +254,16 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
                     <input id="wPayloadOff" placeholder='{"Device":"Patio","send":{"power": "off"}}'>
                 </div>
 
+                <!-- Блок настройки оповещений MAX -->
+                <!-- Блок оповещений в MAX -->
+                <div style="margin-top: 15px; border-top: 1px solid var(--border); padding-top: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <label style="color: var(--accent); font-weight: bold; margin:0;">📢 Оповещения в MAX</label>
+                        <button type="button" class="action" style="padding: 4px 10px; font-size: 11px;" onclick="addAlertRule()">+ Добавить правило</button>
+                    </div>
+                    <div id="alertRulesContainer"></div>
+                </div>
+
                 <div style="display: flex; gap: 8px; margin-top: 14px;">
                     <button type="submit" class="action" id="submitBtn">Добавить</button>
                     <button type="button" class="action danger" id="cancelBtn" style="display:none;" onclick="cancelEdit()">Отмена</button>
@@ -265,11 +275,104 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
             <div id="widgetsList"></div>
         </div>
     </section>
+    <!-- Настройки MAX -->
+    <section id="tab-max" class="tab-panel">
+        <div class="panel">
+            <h2 class="panel-title">Параметры интеграции MAX</h2>
+            <form id="maxForm">
+                <label>Токен авторизации (Authorization)</label>
+                <input id="maxToken" type="password" placeholder="Ваш токен бота MAX" required>
+                
+                <label>ID пользователя (User ID)</label>
+                <input id="maxUserId" placeholder="Например: 123456789" required>
+
+                <div style="display: flex; gap: 8px;">
+                    <button type="submit" class="action">Сохранить</button>
+                    <button type="button" class="action" style="background:#205081; border-color:#2a66a1;" onclick="sendMaxTest()">Тест (Отправить сообщение)</button>
+                </div>
+            </form>
+            <div id="maxResult"></div>
+        </div>
+    </section>
 </main>
+
+<!-- Модальное окно графика -->
+<div id="chartModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; justify-content:center; align-items:center;">
+    <div style="background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; width:90%; max-width:600px; position:relative;">
+        <h3 id="chartTitle" style="margin-top:0; color:var(--text); font-size:16px;">График за 24 часа</h3>
+        <div id="chartContainer" style="width:100%; height:250px; display:flex; align-items:center; justify-content:center;">
+            <svg id="sensorChart" width="100%" height="100%" viewBox="0 0 500 200" style="overflow:visible;"></svg>
+        </div>
+        <button class="action" style="margin-top:15px; width:100%;" onclick="closeChart()">Закрыть</button>
+    </div>
+</div>
 
 <script>
 let globalStates = {};
 let activeWidgets = [];
+
+let currentAlertRules = [];
+
+function renderAlertRules(rules) {
+    const container = document.getElementById("alertRulesContainer");
+    container.replaceChildren();
+    
+    if (!rules || rules.length === 0) {
+        container.innerHTML = '<div class="empty-notice" style="color:var(--muted); font-size:12px; margin-bottom:10px;">Нет активных правил оповещений.</div>';
+        return;
+    }
+
+    rules.forEach((r, idx) => {
+        const isBetween = r.cond === 'between';
+        const div = document.createElement("div");
+        div.className = "alert-rule-card";
+        div.style.cssText = "background:var(--card); border:1px solid var(--border); padding:10px; border-radius:6px; margin-bottom:8px; position:relative;";
+        div.innerHTML = `
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                <span style="font-size:11px; color:var(--muted);">Правило #${idx + 1}</span>
+                <button type="button" class="action danger" style="padding:2px 6px; font-size:10px;" onclick="removeAlertRule(${idx})">Удалить</button>
+            </div>
+            <label>Условие</label>
+            <select class="rCond" onchange="onConditionChange(this)" style="width:100%; padding:6px; margin:4px 0 8px; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
+                <option value="change" ${r.cond==='change'?'selected':''}>При любом изменении</option>
+                <option value="below" ${r.cond==='below'?'selected':''}>Ниже порога (&lt;)</option>
+                <option value="above" ${r.cond==='above'?'selected':''}>Выше порога (&gt;)</option>
+                <option value="between" ${r.cond==='between'?'selected':''}>Между (От и До)</option>
+            </select>
+
+            <div class="singleValBlock" style="display: ${isBetween ? 'none' : 'block'};">
+                <label>Порог</label>
+                <input class="rVal" type="number" step="any" value="${!isBetween && r.val !== undefined ? r.val : ''}" placeholder="Значение порога" style="width:100%; padding:6px; margin:4px 0 8px; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
+            </div>
+
+            <div class="rangeValBlock" style="display: ${isBetween ? 'flex' : 'none'}; gap: 8px; margin-bottom: 8px;">
+                <div style="flex:1;">
+                    <label>От (мин)</label>
+                    <input class="rValMin" type="number" step="any" value="${isBetween && r.val !== undefined ? r.val : ''}" placeholder="Мин" style="width:100%; padding:6px; margin:4px 0 0; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
+                </div>
+                <div style="flex:1;">
+                    <label>До (макс)</label>
+                    <input class="rValMax" type="number" step="any" value="${isBetween && r.valMax !== undefined ? r.valMax : ''}" placeholder="Макс" style="width:100%; padding:6px; margin:4px 0 0; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
+                </div>
+            </div>
+
+            <label>Текст сообщения</label>
+            <input class="rMsg" type="text" value="${r.msg || ''}" placeholder="Текст уведомления" style="width:100%; padding:6px; margin:4px 0 4px; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
+        `;
+        container.appendChild(div);
+    });
+}
+    
+window.addAlertRule = function(cond = 'below', val = '', valMax = '', msg = '') {
+    currentAlertRules.push({ cond, val, valMax, msg });
+    renderAlertRules(currentAlertRules);
+}
+
+window.removeAlertRule = function(index) {
+    currentAlertRules.splice(index, 1);
+    renderAlertRules(currentAlertRules);
+}
+
 function toggleSwitchFields() {
     const type = document.getElementById("wType").value;
     document.getElementById("switchFields").style.display = (type === "switch") ? "block" : "none";
@@ -374,8 +477,10 @@ function renderDashboardWidgets() {
             const num = Number(val);
             const isNegative = !isNaN(num) && num < 0;
             const unitStr = w.unit ? ` <span style="font-size: 14px; color: var(--muted);">${w.unit}</span>` : "";
-            
             card.innerHTML = `<div class="card-label">${w.label}</div><div class="card-value ${isNegative ? 'negative' : ''}">${formattedVal}${unitStr}</div>`;
+            card.style.cursor = "pointer";
+            card.title = "Кликните для просмотра графика";
+            card.onclick = () => openChart(w.topic, w.label, w.unit);
         } else if (w.type === "switch") {
             const valStr = String(val).toLowerCase().trim();
             const isOn = hasValue && (valStr === "on" || valStr === "1" || valStr === "true" || valStr === "yes");
@@ -394,6 +499,55 @@ function renderDashboardWidgets() {
         }
         container.appendChild(card);
     });
+}
+
+async function openChart(topic, label, unit) {
+    document.getElementById("chartTitle").textContent = label + " (24 часа)";
+    document.getElementById("chartModal").style.display = "flex";
+    
+    const svg = document.getElementById("sensorChart");
+    svg.innerHTML = '<text x="250" y="100" fill="#848996" text-anchor="middle">Загрузка данных...</text>';
+
+    try {
+        const res = await fetch(`/api/history?topic=${encodeURIComponent(topic)}`);
+        const data = await res.json();
+
+        if (!Array.isArray(data) || data.length === 0) {
+            svg.innerHTML = '<text x="250" y="100" fill="#848996" text-anchor="middle">Нет данных истории</text>';
+            return;
+        }
+
+        const values = data.map(d => d.val);
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const range = (max - min) || 1;
+
+        let points = "";
+        const width = 500;
+        const height = 180;
+
+        data.forEach((d, i) => {
+            const x = (i / (data.length - 1 || 1)) * width;
+            const y = height - ((d.val - min) / range) * (height - 20) - 10;
+            points += `${x},${y} `;
+        });
+
+        svg.innerHTML = `
+            <rect width="500" height="200" fill="#111319" rx="5"/>
+            <line x1="0" y1="40" x2="500" y2="40" stroke="#242731" stroke-dasharray="4"/>
+            <line x1="0" y1="110" x2="500" y2="110" stroke="#242731" stroke-dasharray="4"/>
+            <line x1="0" y1="180" x2="500" y2="180" stroke="#242731" stroke-dasharray="4"/>
+            <text x="10" y="35" fill="#848996" font-size="10">${max.toFixed(1)} ${unit || ''}</text>
+            <text x="10" y="175" fill="#848996" font-size="10">${min.toFixed(1)} ${unit || ''}</text>
+            <polyline fill="none" stroke="#78d594" stroke-width="3" points="${points}"/>
+        `;
+    } catch(e) {
+        svg.innerHTML = '<text x="250" y="100" fill="#f27d83" text-anchor="middle">Ошибка загрузки графика</text>';
+    }
+}
+
+function closeChart() {
+    document.getElementById("chartModal").style.display = "none";
 }
 
 function renderWidgetsConfigList() {
@@ -443,6 +597,43 @@ async function saveWidgets() {
     renderDashboardWidgets();
 }
 
+async function loadMaxSettings() {
+    try {
+        const res = await fetch("/api/max-settings");
+        const data = await res.json();
+        document.getElementById("maxToken").value = data.token || "";
+        document.getElementById("maxUserId").value = data.userid || "";
+    } catch(e) {}
+}
+
+document.getElementById("maxForm").addEventListener("submit", async function(e) {
+    e.preventDefault();
+    const res = document.getElementById("maxResult");
+    const body = new URLSearchParams({
+        token: document.getElementById("maxToken").value.trim(),
+        userid: document.getElementById("maxUserId").value.trim()
+    });
+    try {
+        const response = await fetch("/api/max-settings", { method: "POST", body });
+        res.textContent = await response.text();
+        res.className = "ok";
+    } catch(err) { res.textContent = "Ошибка: " + err; res.className = "error"; }
+});
+
+async function sendMaxTest() {
+    const res = document.getElementById("maxResult");
+    res.textContent = "Отправка тестового сообщения...";
+    res.className = "";
+    try {
+        const response = await fetch("/api/max-test", { method: "POST" });
+        res.textContent = await response.text();
+        res.className = response.ok ? "ok" : "error";
+    } catch(err) {
+        res.textContent = "Ошибка теста: " + err;
+        res.className = "error";
+    }
+}
+
 window.editWidget = function(index) {
     const w = activeWidgets[index];
     document.getElementById("editIndex").value = index;
@@ -453,6 +644,8 @@ window.editWidget = function(index) {
     document.getElementById("wPayloadOn").value = w.payloadOn || "";
     document.getElementById("wPayloadOff").value = w.payloadOff || "";
     document.getElementById("wUnit").value = w.unit || "";
+    currentAlertRules = w.alerts || [];
+    renderAlertRules(currentAlertRules);
     
     toggleSwitchFields();
     
@@ -464,12 +657,25 @@ window.editWidget = function(index) {
     window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
+window.onConditionChange = function(select) {
+    const card = select.closest('.alert-rule-card');
+    const isBetween = select.value === 'between';
+    
+    const singleBlock = card.querySelector('.singleValBlock');
+    const rangeBlock = card.querySelector('.rangeValBlock');
+    
+    if (singleBlock) singleBlock.style.display = isBetween ? 'none' : 'block';
+    if (rangeBlock) rangeBlock.style.display = isBetween ? 'flex' : 'none';
+}
+    
 window.cancelEdit = function() {
     document.getElementById("addWidgetForm").reset();
     document.getElementById("editIndex").value = "-1";
     document.getElementById("formTitle").textContent = "Добавить элемент на дашборд";
     document.getElementById("submitBtn").textContent = "Добавить";
     document.getElementById("cancelBtn").style.display = "none";
+    currentAlertRules = [];
+    renderAlertRules(currentAlertRules);
     toggleSwitchFields();
 }
 
@@ -485,7 +691,28 @@ document.getElementById("addWidgetForm").addEventListener("submit", async functi
     e.preventDefault();
     const editIndex = parseInt(document.getElementById("editIndex").value);
     const type = document.getElementById("wType").value;
-    
+
+    // Сбор правил оповещений (выбираем только карточки правил, игнорируя текст-заглушку)
+    const alertRules = [];
+    document.querySelectorAll("#alertRulesContainer .alert-rule-card").forEach(div => {
+        const cond = div.querySelector(".rCond").value;
+        let val = 0, valMax = 0;
+        
+        if (cond === 'between') {
+            val = parseFloat(div.querySelector(".rValMin").value) || 0;
+            valMax = parseFloat(div.querySelector(".rValMax").value) || 0;
+        } else {
+            val = parseFloat(div.querySelector(".rVal").value) || 0;
+        }
+
+        alertRules.push({
+            cond: cond,
+            val: val,
+            valMax: valMax,
+            msg: div.querySelector(".rMsg").value.trim()
+        });
+    });
+
     const w = {
         label: document.getElementById("wLabel").value,
         type: type,
@@ -493,7 +720,8 @@ document.getElementById("addWidgetForm").addEventListener("submit", async functi
         unit: type === "sensor" ? document.getElementById("wUnit").value.trim() : "",
         cmdTopic: type === "switch" ? document.getElementById("wCmdTopic").value.trim() : "",
         payloadOn: type === "switch" ? document.getElementById("wPayloadOn").value.trim() : "",
-        payloadOff: type === "switch" ? document.getElementById("wPayloadOff").value.trim() : ""
+        payloadOff: type === "switch" ? document.getElementById("wPayloadOff").value.trim() : "",
+        alerts: alertRules
     };
 
     if (editIndex >= 0) {
@@ -598,6 +826,7 @@ async function initApp() {
     await loadSettings();
     await loadWidgets();
     await updateDashboard();
+    await loadMaxSettings();
     setInterval(updateDashboard, 3000);
 }
 
@@ -719,6 +948,62 @@ void handleCommand() {
     }
 }
 
+void handleGetMaxSettings() {
+    SystemSettings s = Settings::get();
+    JsonDocument doc;
+    doc["token"] = s.maxToken;
+    doc["userid"] = s.maxUserId;
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json; charset=utf-8", response);
+}
+
+void handlePostMaxSettings() {
+    if (!server.hasArg("token") || !server.hasArg("userid")) {
+        server.send(400, "text/plain", "Missing fields");
+        return;
+    }
+    Settings::saveMax(server.arg("token"), server.arg("userid"));
+    server.send(200, "text/plain", "Настройки MAX успешно сохранены!");
+}
+
+void handleMaxTest() {
+    bool ok = sendMaxNotification("Тестовое уведомление от шлюза ESP32!");
+    if (ok) {
+        server.send(200, "text/plain", "Тестовое сообщение успешно отправлено в MAX!");
+    } else {
+        server.send(500, "text/plain", "Ошибка отправки. Проверьте токен, User ID и интернет на шлюзе.");
+    }
+}
+
+void handleHistory() {
+    if (!server.hasArg("topic")) {
+        server.send(400, "text/plain", "Missing topic");
+        return;
+    }
+    String targetTopic = server.arg("topic");
+    
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+
+    if (cachedStates != nullptr) {
+        for (const auto& st : *cachedStates) {
+            if (strcmp(st.topic, targetTopic.c_str()) == 0) {
+                for (const auto& pt : st.history) {
+                    JsonObject obj = arr.add<JsonObject>();
+                    obj["val"] = pt.value;
+                    obj["time"] = pt.timestamp;
+                }
+                break;
+            }
+        }
+    }
+
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json; charset=utf-8", response);
+}
+
 } // namespace
 
 namespace WebDashboard {
@@ -735,6 +1020,10 @@ namespace WebDashboard {
         server.on("/api/settings", HTTP_GET, handleGetSettings);
         server.on("/api/settings", HTTP_POST, handlePostSettings);
         server.on("/api/command", HTTP_POST, handleCommand);
+        server.on("/api/max-settings", HTTP_GET, handleGetMaxSettings);
+        server.on("/api/max-settings", HTTP_POST, handlePostMaxSettings);
+        server.on("/api/max-test", HTTP_POST, handleMaxTest);
+        server.on("/api/history", HTTP_GET, handleHistory);
         server.begin();
     }
 
