@@ -244,10 +244,6 @@ void refreshFavoriteTopics() {
     );
 }
 
-// ============================================================
-// Кэш состояний
-// ============================================================
-
 // Проверка и отправка оповещений в MAX для избранных топиков
 void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int length) {
     SystemSettings s = Settings::get();
@@ -283,6 +279,8 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
             }
         }
 
+        // Сохраняем текстовое значение, а числовое вычисляем для порогов
+        String currentStr = valToEval;
         float currentVal = valToEval.toFloat();
 
         int ruleIdx = 0;
@@ -297,6 +295,8 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
             float thresholdMax = alert["valMax"] | 0.0f;
             String alertMsg = alert["msg"].as<String>();
 
+            // Используем строковое состояние для сохранения прошлого значения (чтобы работало и с текстом)
+            // Но для старой структуры сохраним совместимость через хелпер или расширим структуру
             RuleAlertState* ast = findRuleAlertState(topic, ruleIdx);
             if (!ast) {
                 RuleAlertState newAst;
@@ -314,7 +314,8 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
             bool cooldownOk = (now - ast->lastSentTime > 60000UL || ast->lastSentTime == 0);
 
             if (cooldownOk) {
-                if (alertCond == "change" && ast->hasValue && valToEval != String(ast->lastValue)) {
+                // Для change сравниваем строки (чтобы ловить текст вроде ON/OFF)
+                if (alertCond == "change" && ast->hasValue && currentStr != String(ast->lastValue)) {
                     trigger = true;
                 } else if (alertCond == "below" && currentVal < thresholdVal && (ast->lastValue >= thresholdVal || !ast->hasValue)) {
                     trigger = true;
@@ -329,9 +330,23 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
                 }
 
                 if (trigger) {
-                    Serial.printf("[MAX ALERT] Правило #%d для %s сработало. Отправка...\n", ruleIdx, topic);
+                    String widgetLabel = w["label"] | "Датчик";
+                    String finalMsg = alertMsg;
+
+                    if (alertCond == "change") {
+                        if (finalMsg.isEmpty()) {
+                            finalMsg = widgetLabel + ": " + currentStr;
+                        } else {
+                            finalMsg = alertMsg + " — " + widgetLabel + ": " + currentStr;
+                        }
+                    } else {
+                        finalMsg = alertMsg + " (" + widgetLabel + ": " + currentStr + ")";
+                    }
+
+                    Serial.printf("[MAX ALERT] Правило #%d для %s сработало: %s\n", ruleIdx, topic, finalMsg.c_str());
+                    
                     if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
-                        pendingAlerts.push_back(alertMsg);
+                        pendingAlerts.push_back(finalMsg);
                     }
                     ast->lastSentTime = now;
                 }
@@ -345,7 +360,9 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
     }
 }
 
-// Объединенная функция сохранения в кэш
+// ============================================================
+// Кэш состояний
+// ============================================================
 bool saveStateToCache(
     const char* topic,
     const byte* payload,

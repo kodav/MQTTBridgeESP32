@@ -38,6 +38,6 @@ constexpr int LED_PIN = 2;
 constexpr const char* DEFAULT_MAX_TOKEN = "";
 constexpr const char* DEFAULT_MAX_USER_ID = "";
 
-// Шаг 10 минут (600000 мс), храним 144 точки (24 часа)
-constexpr unsigned long HISTORY_INTERVAL_MS = 600000UL; 
-constexpr size_t MAX_HISTORY_POINTS = 144;
+// Шаг 1 минута (60000 мс), храним 360 точек (6 часов истории)
+constexpr unsigned long HISTORY_INTERVAL_MS = 60000UL; 
+constexpr size_t MAX_HISTORY_POINTS = 360;
