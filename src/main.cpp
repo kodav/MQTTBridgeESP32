@@ -3,7 +3,7 @@
 #include <PubSubClient.h>
 #include <EmbeddedMqttBroker.h>
 #include <ArduinoJson.h>
-
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
@@ -663,6 +663,13 @@ void startServices() {
         false
     );
 
+    // Запуск mDNS (чтобы устройство было доступно по имени cottage-gateway.local)
+    if (MDNS.begin(DEVICE_HOSTNAME)) {
+        Serial.printf("[mDNS] Сервер запущен. Адрес в сети: http://%s.local\n", DEVICE_HOSTNAME);
+    } else {
+        Serial.println("[mDNS] Ошибка запуска службы mDNS");
+    }
+
     servicesStarted = true;
 
     Serial.printf(
@@ -847,6 +854,13 @@ bool startSetupAccessPoint() {
         true
     );
 
+    // Запуск mDNS (чтобы устройство было доступно по имени cottage-gateway.local)
+    if (MDNS.begin(DEVICE_HOSTNAME)) {
+        Serial.printf("[mDNS] Сервер запущен. Адрес в сети: http://%s.local\n", DEVICE_HOSTNAME);
+    } else {
+        Serial.println("[mDNS] Ошибка запуска службы mDNS");
+    }
+
     return true;
 }
 
@@ -1030,27 +1044,44 @@ void loop() {
         mainMqtt.loop();
     }
 
-    // Отслеживание изменения статуса главного MQTT-брокера
+    // Отслеживание изменения статуса главного MQTT-брокера с защитой от ложных срабатываний
+    static unsigned long disconnectStartTime = 0;
+    static bool alertSentOffline = false;
     bool currentMainStatus = mainMqtt.connected();
-    if (currentMainStatus != lastMainMqttStatus) {
-        lastMainMqttStatus = currentMainStatus;
+
+    if (currentMainStatus) {
+        // Если связь есть: сбрасываем таймер обрыва
+        disconnectStartTime = 0;
         
-        if (currentMainStatus) {
-            // Связь восстановилась
-            Serial.println("[MAX ALERT] Главный MQTT-сервер: связь восстановлена!");
-            if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
-                pendingAlerts.push_back("🟢 Связь с главным MQTT-сервером восстановлена!");
-            }
-        } else {
-            // Связь потеряна (и если шлюз до этого был успешно запущен в сети Wi-Fi)
-            if (WiFi.status() == WL_CONNECTED && servicesStarted) {
-                Serial.println("[MAX ALERT] Главный MQTT-сервер: связь потеряна!");
+        // Если до этого уходило уведомление об офлайне, сообщаем о восстановлении
+        if (!lastMainMqttStatus) {
+            lastMainMqttStatus = true;
+            if (alertSentOffline) {
+                Serial.println("[MAX ALERT] Главный MQTT-сервер: связь восстановлена!");
                 if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
-                    pendingAlerts.push_back("🔴 Внимание: потеряна связь с главным MQTT-сервером!");
+                    pendingAlerts.push_back("🟢 Связь с главным MQTT-сервером восстановлена!");
+                }
+                alertSentOffline = false;
+            }
+        }
+    } else {
+        // Связь пропала
+        if (lastMainMqttStatus) {
+            if (disconnectStartTime == 0) {
+                disconnectStartTime = millis(); // Запоминаем момент начала обрыва
+            } else if (millis() - disconnectStartTime > 30000UL) { 
+                // Считаем связь потерянной ТОЛЬКО если она отсутствует дольше 30 секунд подряд
+                lastMainMqttStatus = false;
+                if (WiFi.status() == WL_CONNECTED && servicesStarted && !alertSentOffline) {
+                    Serial.println("[MAX ALERT] Главный MQTT-сервер: связь потеряна!");
+                    if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
+                        pendingAlerts.push_back("🔴 Внимание: потеряна связь с главным MQTT-сервером!");
+                    }
+                    alertSentOffline = true;
                 }
             }
         }
-    }    
-
+    }
+    
     delay(5);
 }

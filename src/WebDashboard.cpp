@@ -4,6 +4,7 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <cstring>
+#include <ElegantOTA.h>
 
 namespace {
 
@@ -145,6 +146,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 <body>
 <header>
     <div class="brand">MQTT Gateway</div>
+    <a href="/update" target="_blank" style="color: var(--muted); text-decoration: none; font-size: 12px; transition: color 0.2s;" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Прошивка (OTA) &rarr;</a>
 </header>
 <main>
     <nav class="tabs">
@@ -1012,6 +1014,8 @@ namespace WebDashboard {
         mainMqttClient = &mainMqtt;
         cachedStates = &states;
         isConfigMode = apMode;
+
+        ElegantOTA.begin(&server);
 
         server.on("/", HTTP_GET, handleDashboard);
         server.on("/api/status", HTTP_GET, handleStatus);
