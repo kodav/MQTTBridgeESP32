@@ -985,6 +985,13 @@ void handleHistory() {
     }
     String targetTopic = server.arg("topic");
     
+    // Отсекаем путь JSON (например, #Temperature), чтобы найти базовый топик истории
+    int hashIdx = targetTopic.indexOf('#');
+    if (hashIdx >= 0) {
+        targetTopic = targetTopic.substring(0, hashIdx);
+        targetTopic.trim();
+    }
+    
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
 
