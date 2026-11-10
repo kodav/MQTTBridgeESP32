@@ -87,6 +87,7 @@ struct RuleAlertState {
     String topic;
     int ruleIndex;
     float lastValue = 0;
+    String lastStrValue = ""; // Сохраняем точный текст для сравнения change
     bool hasValue = false;
     unsigned long lastSentTime = 0;
 };
@@ -245,6 +246,7 @@ void refreshFavoriteTopics() {
 }
 
 // Проверка и отправка оповещений в MAX для избранных топиков
+// Проверка и отправка оповещений в MAX для избранных топиков
 void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int length) {
     SystemSettings s = Settings::get();
     JsonDocument doc;
@@ -279,7 +281,6 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
             }
         }
 
-        // Сохраняем текстовое значение, а числовое вычисляем для порогов
         String currentStr = valToEval;
         float currentVal = valToEval.toFloat();
 
@@ -295,14 +296,13 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
             float thresholdMax = alert["valMax"] | 0.0f;
             String alertMsg = alert["msg"].as<String>();
 
-            // Используем строковое состояние для сохранения прошлого значения (чтобы работало и с текстом)
-            // Но для старой структуры сохраним совместимость через хелпер или расширим структуру
             RuleAlertState* ast = findRuleAlertState(topic, ruleIdx);
             if (!ast) {
                 RuleAlertState newAst;
                 newAst.topic = topic;
                 newAst.ruleIndex = ruleIdx;
                 newAst.lastValue = currentVal;
+                newAst.lastStrValue = currentStr;
                 newAst.hasValue = true;
                 newAst.lastSentTime = 0;
                 ruleAlertStates.push_back(newAst);
@@ -311,48 +311,61 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
 
             bool trigger = false;
             unsigned long now = millis();
-            bool cooldownOk = (now - ast->lastSentTime > 60000UL || ast->lastSentTime == 0);
 
-            if (cooldownOk) {
-                // Для change сравниваем строки (чтобы ловить текст вроде ON/OFF)
-                if (alertCond == "change" && ast->hasValue && currentStr != String(ast->lastValue)) {
-                    trigger = true;
-                } else if (alertCond == "below" && currentVal < thresholdVal && (ast->lastValue >= thresholdVal || !ast->hasValue)) {
-                    trigger = true;
-                } else if (alertCond == "above" && currentVal > thresholdVal && (ast->lastValue <= thresholdVal || !ast->hasValue)) {
-                    trigger = true;
-                } else if (alertCond == "between") {
-                    bool isInside = (currentVal >= thresholdVal && currentVal <= thresholdMax);
-                    bool wasInside = (ast->hasValue && ast->lastValue >= thresholdVal && ast->lastValue <= thresholdMax);
-                    if (isInside && (!wasInside || !ast->hasValue)) {
+            if (alertCond == "change") {
+                // Для change сравниваем чистые строки без кулдауна в 60 сек, 
+                // но с защитой от быстрого дребезга (не чаще чем раз в 5 сек)
+                if (ast->hasValue && currentStr != ast->lastStrValue) {
+                    if (now - ast->lastSentTime > 5000UL || ast->lastSentTime == 0) {
                         trigger = true;
+                        ast->lastSentTime = now;
                     }
                 }
-
-                if (trigger) {
-                    String widgetLabel = w["label"] | "Датчик";
-                    String finalMsg = alertMsg;
-
-                    if (alertCond == "change") {
-                        if (finalMsg.isEmpty()) {
-                            finalMsg = widgetLabel + ": " + currentStr;
-                        } else {
-                            finalMsg = alertMsg + " — " + widgetLabel + ": " + currentStr;
+            } else {
+                // Для порогов (below, above, between) оставляем кулдаун в 60 сек
+                bool cooldownOk = (now - ast->lastSentTime > 60000UL || ast->lastSentTime == 0);
+                if (cooldownOk) {
+                    if (alertCond == "below" && currentVal < thresholdVal && (ast->lastValue >= thresholdVal || !ast->hasValue)) {
+                        trigger = true;
+                    } else if (alertCond == "above" && currentVal > thresholdVal && (ast->lastValue <= thresholdVal || !ast->hasValue)) {
+                        trigger = true;
+                    } else if (alertCond == "between") {
+                        bool isInside = (currentVal >= thresholdVal && currentVal <= thresholdMax);
+                        bool wasInside = (ast->hasValue && ast->lastValue >= thresholdVal && ast->lastValue <= thresholdMax);
+                        if (isInside && (!wasInside || !ast->hasValue)) {
+                            trigger = true;
                         }
-                    } else {
-                        finalMsg = alertMsg + " (" + widgetLabel + ": " + currentStr + ")";
                     }
 
-                    Serial.printf("[MAX ALERT] Правило #%d для %s сработало: %s\n", ruleIdx, topic, finalMsg.c_str());
-                    
-                    if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
-                        pendingAlerts.push_back(finalMsg);
+                    if (trigger) {
+                        ast->lastSentTime = now;
                     }
-                    ast->lastSentTime = now;
+                }
+            }
+
+            if (trigger) {
+                String widgetLabel = w["label"] | "Датчик";
+                String finalMsg = alertMsg;
+
+                if (alertCond == "change") {
+                    if (finalMsg.isEmpty()) {
+                        finalMsg = widgetLabel + ": " + currentStr;
+                    } else {
+                        finalMsg = alertMsg + " — " + widgetLabel + ": " + currentStr;
+                    }
+                } else {
+                    finalMsg = alertMsg + " (" + widgetLabel + ": " + currentStr + ")";
+                }
+
+                Serial.printf("[MAX ALERT] Правило #%d для %s сработало: %s\n", ruleIdx, topic, finalMsg.c_str());
+                
+                if (pendingAlerts.size() < MAX_PENDING_ALERTS) {
+                    pendingAlerts.push_back(finalMsg);
                 }
             }
 
             ast->lastValue = currentVal;
+            ast->lastStrValue = currentStr;
             ast->hasValue = true;
             ruleIdx++;
         }
