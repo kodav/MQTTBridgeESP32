@@ -50,6 +50,26 @@ PubSubClient mainMqtt(mainNetworkClient);
 
 // Вектор передаётся в WebDashboard и существует всё время работы.
 std::vector<CachedState> stateCache;
+std::vector<JsonFieldHistory> jsonFieldHistories;
+
+// Считаем все выделенные буферы: обычные и для полей JSON.
+size_t countAllocatedHistories() {
+    size_t count = 0;
+
+    for (const CachedState& state : stateCache) {
+        if (state.history) {
+            ++count;
+        }
+    }
+
+    for (const JsonFieldHistory& field : jsonFieldHistories) {
+        if (field.history) {
+            ++count;
+        }
+    }
+
+    return count;
+}
 
 // Только имена топиков, необходимых виджетам.
 std::vector<String> favoriteTopics;
@@ -254,6 +274,8 @@ void refreshFavoriteTopics() {
     }
 
     favoriteTopics.swap(newTopics);
+    // Конфигурация полей могла измениться.
+    jsonFieldHistories.clear();
     // Правила могли быть удалены, изменены или переставлены.
     ruleAlertStates.clear();
 
@@ -414,6 +436,211 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
     }
 }
 
+// Поиск поля JSON без учёта регистра.
+// Ищет также внутри вложенных объектов и массивов.
+JsonVariantConst findJsonFieldRecursive(
+    JsonVariantConst node,
+    const char* targetKey
+) {
+    if (node.is<JsonObjectConst>()) {
+        JsonObjectConst object = node.as<JsonObjectConst>();
+
+        for (JsonPairConst pair : object) {
+            if (strcasecmp(pair.key().c_str(), targetKey) == 0) {
+                return pair.value();
+            }
+
+            JsonVariantConst found =
+                findJsonFieldRecursive(pair.value(), targetKey);
+
+            if (!found.isNull()) {
+                return found;
+            }
+        }
+    } else if (node.is<JsonArrayConst>()) {
+        JsonArrayConst array = node.as<JsonArrayConst>();
+
+        for (JsonVariantConst item : array) {
+            JsonVariantConst found =
+                findJsonFieldRecursive(item, targetKey);
+
+            if (!found.isNull()) {
+                return found;
+            }
+        }
+    }
+
+    return JsonVariantConst();
+}
+
+bool parseHistoryNumber(const char* text, float& result) {
+    if (text == nullptr) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const float value = strtof(text, &end);
+
+    if (end == text || end == nullptr) {
+        return false;
+    }
+
+    while (*end != '\0' &&
+           std::isspace(static_cast<unsigned char>(*end))) {
+        ++end;
+    }
+
+    if (*end != '\0' || !std::isfinite(value)) {
+        return false;
+    }
+
+    result = value;
+    return true;
+}
+
+JsonFieldHistory* findJsonFieldHistory(const String& topic) {
+    for (JsonFieldHistory& field : jsonFieldHistories) {
+        if (field.topic == topic) {
+            return &field;
+        }
+    }
+
+    return nullptr;
+}
+
+void recordJsonFieldHistories(
+    const char* baseTopic,
+    const char* payload
+) {
+    if (!alertWidgetsDoc.is<JsonArray>()) {
+        return;
+    }
+
+    // JSON разбираем не более одного раза на MQTT-сообщение.
+    JsonDocument payloadDoc;
+    bool parseAttempted = false;
+    bool payloadIsJson = false;
+
+    for (JsonObject widget : alertWidgetsDoc.as<JsonArray>()) {
+        const char* widgetType = widget["type"] | "";
+
+        if (strcmp(widgetType, "sensor") != 0) {
+            continue;
+        }
+
+        String configuredTopic = widget["topic"] | "";
+        configuredTopic.trim();
+
+        const int separator = configuredTopic.indexOf('#');
+
+        if (separator < 0) {
+            continue;
+        }
+
+        String widgetBase = configuredTopic.substring(0, separator);
+        String jsonKey = configuredTopic.substring(separator + 1);
+
+        widgetBase.trim();
+        jsonKey.trim();
+
+        if (widgetBase != baseTopic || jsonKey.isEmpty()) {
+            continue;
+        }
+
+        if (!parseAttempted) {
+            parseAttempted = true;
+            payloadIsJson = !deserializeJson(payloadDoc, payload);
+        }
+
+        if (!payloadIsJson) {
+            return;
+        }
+
+        JsonVariantConst value = findJsonFieldRecursive(
+            payloadDoc.as<JsonVariantConst>(),
+            jsonKey.c_str()
+        );
+
+        if (value.isNull() ||
+            value.is<JsonObjectConst>() ||
+            value.is<JsonArrayConst>() ||
+            value.is<bool>()) {
+            continue;
+        }
+
+        const String valueText = value.as<String>();
+        float numericValue = 0;
+
+        if (!parseHistoryNumber(valueText.c_str(), numericValue)) {
+            continue;
+        }
+
+        // Используем нормализованное имя, включая поле после #.
+        const String historyTopic = widgetBase + "#" + jsonKey;
+
+        JsonFieldHistory* field = findJsonFieldHistory(historyTopic);
+
+        if (field == nullptr) {
+            if (countAllocatedHistories() >= MAX_HISTORY_TOPICS) {
+                continue;
+            }
+
+            const size_t historyBytes =
+                sizeof(HistoryPoint) * MAX_HISTORY_POINTS;
+
+            if (ESP.getFreeHeap() <= historyBytes + 40000UL) {
+                continue;
+            }
+
+            // Сначала выделяем память. Если выделение не удалось,
+            // пустая запись в списке не останется.
+            std::unique_ptr<HistoryPoint[]> buffer(
+                new (std::nothrow) HistoryPoint[MAX_HISTORY_POINTS]
+            );
+
+            if (!buffer) {
+                Serial.printf(
+                    "[HISTORY] Нет памяти для %s\n",
+                    historyTopic.c_str()
+                );
+                continue;
+            }
+
+            jsonFieldHistories.emplace_back();
+            field = &jsonFieldHistories.back();
+            field->topic = historyTopic;
+            field->history = std::move(buffer);
+
+            Serial.printf(
+                "[HISTORY] Создана история: %s\n",
+                field->topic.c_str()
+            );
+        }
+
+        const unsigned long now = millis();
+
+        if (field->historyCount > 0 &&
+            now - field->historyLastAt < HISTORY_INTERVAL_MS) {
+            continue;
+        }
+
+        size_t index;
+
+        if (field->historyCount < MAX_HISTORY_POINTS) {
+            index = (field->historyStart + field->historyCount)
+                    % MAX_HISTORY_POINTS;
+
+            ++field->historyCount;
+        } else {
+            index = field->historyStart;
+            field->historyStart =
+                (field->historyStart + 1) % MAX_HISTORY_POINTS;
+        }
+
+        field->history[index] = {numericValue, now};
+        field->historyLastAt = now;
+    }
+}
 // ============================================================
 // Кэш состояний
 // ============================================================
@@ -498,13 +725,7 @@ bool saveStateToCache(
     if (isNumeric) {
         // Выделяем память истории один раз.
         if (!state->history) {
-            size_t allocatedHistories = 0;
-
-            for (const CachedState& cached : stateCache) {
-                if (cached.history) {
-                    ++allocatedHistories;
-                }
-            }
+            const size_t allocatedHistories = countAllocatedHistories();
 
             const size_t historyBytes =
                 sizeof(HistoryPoint) * MAX_HISTORY_POINTS;
@@ -550,6 +771,7 @@ bool saveStateToCache(
         }
     }
 
+    recordJsonFieldHistories(topic, state->payload);
     // Проверяем условия и отправляем оповещение MAX
     checkAndSendMaxAlert(topic, payload, length);
 

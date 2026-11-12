@@ -46,3 +46,5 @@ constexpr size_t MAX_HISTORY_POINTS = 360;
 // Максимум топиков, которым выделяется буфер истории.
 // Остальные виджеты работают без графика.
 constexpr size_t MAX_HISTORY_TOPICS = 12;
+
+constexpr const char* FIRMWARE_VERSION = "v1.1.0";

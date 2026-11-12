@@ -145,8 +145,13 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 </head>
 <body>
 <header>
-    <div class="brand">MQTT Gateway</div>
-    <a href="/update" target="_blank" style="color: var(--muted); text-decoration: none; font-size: 12px; transition: color 0.2s;" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Прошивка (OTA) &rarr;</a>
+    <div class="brand">
+        MQTT Gateway
+        <div class="card-value small" id="fwVersion">—</div>
+    </div>
+    
+</div>
+    <a href="/update" style="color: var(--muted); text-decoration: none; font-size: 12px; transition: color 0.2s;" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Прошивка (OTA) &rarr;</a>
 </header>
 <main>
     <nav class="tabs">
@@ -748,6 +753,7 @@ async function updateDashboard() {
         
         document.getElementById("wifiRssi").textContent = data.rssi + " dBm";
         document.getElementById("freeHeap").textContent = Math.round(data.free_heap / 1024) + " КБ";
+        document.getElementById("fwVersion").textContent = data.version || "—";
         setConnection("localMqtt", data.local_mqtt);
         setConnection("mainMqtt", data.main_mqtt);
 
@@ -857,6 +863,9 @@ void handleStatus() {
     doc["local_mqtt"] = localMqttClient && localMqttClient->connected();
     doc["main_mqtt"] = mainMqttClient && mainMqttClient->connected();
 
+    // Добавляем версию и дату сборки
+    doc["version"] = String("ver. ") + FIRMWARE_VERSION + " (" + __DATE__ + " " + __TIME__ + ")";
+    
     JsonArray states = doc["states"].to<JsonArray>();
     unsigned long now = millis();
     
@@ -1012,33 +1021,63 @@ void handleHistory() {
         server.send(400, "text/plain", "Missing topic");
         return;
     }
+
     String targetTopic = server.arg("topic");
-    
-    // Отсекаем путь JSON (например, #Temperature), чтобы найти базовый топик истории
-    int hashIdx = targetTopic.indexOf('#');
-    if (hashIdx >= 0) {
-        targetTopic = targetTopic.substring(0, hashIdx);
-        targetTopic.trim();
-    }
-    
+    targetTopic.trim();
+
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
 
-    if (cachedStates != nullptr) {
-        for (const auto& st : *cachedStates) {
-            if (strcmp(st.topic, targetTopic.c_str()) == 0) {
-                for (size_t i = 0; i < st.historyCount; ++i) {
-                    const size_t index =
-                        (st.historyStart + i) % MAX_HISTORY_POINTS;
+    const int hashIdx = targetTopic.indexOf('#');
 
-                    const HistoryPoint& pt = st.history[index];
+    if (hashIdx >= 0) {
+        // История конкретного поля JSON.
+        String baseTopic = targetTopic.substring(0, hashIdx);
+        String jsonKey = targetTopic.substring(hashIdx + 1);
 
-                    JsonObject obj = arr.add<JsonObject>();
-                    obj["val"] = pt.value;
-                    obj["time"] = pt.timestamp;
-                }
-                break;
+        baseTopic.trim();
+        jsonKey.trim();
+
+        const String historyTopic = baseTopic + "#" + jsonKey;
+
+        for (const JsonFieldHistory& field : jsonFieldHistories) {
+            if (field.topic != historyTopic || !field.history) {
+                continue;
             }
+
+            for (size_t i = 0; i < field.historyCount; ++i) {
+                const size_t index =
+                    (field.historyStart + i) % MAX_HISTORY_POINTS;
+
+                const HistoryPoint& pt = field.history[index];
+
+                JsonObject obj = arr.add<JsonObject>();
+                obj["val"] = pt.value;
+                obj["time"] = pt.timestamp;
+            }
+
+            break;
+        }
+    } else if (cachedStates != nullptr) {
+        // История обычного числового MQTT-топика.
+        for (const CachedState& st : *cachedStates) {
+            if (strcmp(st.topic, targetTopic.c_str()) != 0 ||
+                !st.history) {
+                continue;
+            }
+
+            for (size_t i = 0; i < st.historyCount; ++i) {
+                const size_t index =
+                    (st.historyStart + i) % MAX_HISTORY_POINTS;
+
+                const HistoryPoint& pt = st.history[index];
+
+                JsonObject obj = arr.add<JsonObject>();
+                obj["val"] = pt.value;
+                obj["time"] = pt.timestamp;
+            }
+
+            break;
         }
     }
 
@@ -1074,5 +1113,6 @@ namespace WebDashboard {
 
     void handleClient() {
         server.handleClient();
+        ElegantOTA.loop();
     }
 }
