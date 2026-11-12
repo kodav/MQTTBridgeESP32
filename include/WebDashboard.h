@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <vector>
+#include <memory>
 #include "config.h"
 
 struct HistoryPoint {
@@ -12,10 +13,19 @@ struct HistoryPoint {
 
 struct CachedState {
     bool used = false;
+
     char topic[MAX_TOPIC_LENGTH + 1] = {};
     char payload[MAX_PAYLOAD_LENGTH + 1] = {};
+
     unsigned long updatedAt = 0;
-    std::vector<HistoryPoint> history; // Буфер истории для графика
+
+    // Память под историю выделяется только для числовых значений
+    // и только при наличии свободного лимита.
+    std::unique_ptr<HistoryPoint[]> history;
+
+    size_t historyStart = 0;
+    size_t historyCount = 0;
+    unsigned long historyLastAt = 0;
 };
 
 // Глобальная функция отправки в MAX

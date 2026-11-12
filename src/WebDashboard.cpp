@@ -590,11 +590,14 @@ async function loadWidgets() {
 }
 
 async function saveWidgets() {
-    await fetch("/api/widgets", {
+    const response = await fetch("/api/widgets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(activeWidgets)
     });
+    if (!response.ok) {
+        throw new Error(await response.text());
+    }
     renderWidgetsConfigList();
     renderDashboardWidgets();
 }
@@ -876,12 +879,38 @@ void handleGetWidgets() {
 }
 
 void handlePostWidgets() {
-    if (server.hasArg("plain")) {
-        Settings::saveWidgets(server.arg("plain"));
-        server.send(200, "text/plain", "OK");
-    } else {
-        server.send(400, "text/plain", "Bad Request");
+    if (!server.hasArg("plain")) {
+        server.send(400, "text/plain", "Missing body");
+        return;
     }
+
+    const String body = server.arg("plain");
+
+    constexpr size_t MAX_WIDGETS_JSON_BYTES = 8192;
+
+    if (body.length() > MAX_WIDGETS_JSON_BYTES) {
+        server.send(
+            413,
+            "text/plain; charset=utf-8",
+            "Конфигурация виджетов превышает 8192 байта"
+        );
+        return;
+    }
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, body);
+
+    if (error || !doc.is<JsonArray>()) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Ожидается корректный JSON-массив виджетов"
+        );
+        return;
+    }
+
+    Settings::saveWidgets(body);
+    server.send(200, "text/plain", "OK");
 }
 
 void handleGetSettings() {
@@ -998,7 +1027,12 @@ void handleHistory() {
     if (cachedStates != nullptr) {
         for (const auto& st : *cachedStates) {
             if (strcmp(st.topic, targetTopic.c_str()) == 0) {
-                for (const auto& pt : st.history) {
+                for (size_t i = 0; i < st.historyCount; ++i) {
+                    const size_t index =
+                        (st.historyStart + i) % MAX_HISTORY_POINTS;
+
+                    const HistoryPoint& pt = st.history[index];
+
                     JsonObject obj = arr.add<JsonObject>();
                     obj["val"] = pt.value;
                     obj["time"] = pt.timestamp;

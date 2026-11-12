@@ -10,6 +10,13 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <utility>
+
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <new>
+#include <esp_heap_caps.h>
 
 #include "config.h"
 #include "Settings.h"
@@ -55,6 +62,10 @@ unsigned long lastAlertProcessTime = 0;
 // Последняя обработанная конфигурация виджетов.
 String lastWidgetsJson;
 bool widgetsLoaded = false;
+// Разобранная конфигурация используется повторно при проверке правил.
+JsonDocument alertWidgetsDoc;
+
+constexpr size_t MAX_RULE_ALERT_STATES = 128;
 
 // PubSubClient хранит указатель на строку хоста, поэтому строка
 // должна существовать дольше, чем локальная переменная функции.
@@ -110,6 +121,24 @@ bool startsWith(const char* text, const char* prefix) {
     }
 
     return strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+bool endsWith(const char* text, const char* suffix) {
+    if (text == nullptr || suffix == nullptr) {
+        return false;
+    }
+
+    const size_t textLen = strlen(text);
+    const size_t suffixLen = strlen(suffix);
+
+    return textLen >= suffixLen &&
+           strcmp(text + textLen - suffixLen, suffix) == 0;
+}
+
+bool isCommandTopic(const char* topic) {
+    return startsWith(topic, "cmnd/") ||
+           endsWith(topic, "/command") ||
+           endsWith(topic, "/set");
 }
 
 // Проверка топика для публикации.
@@ -225,6 +254,12 @@ void refreshFavoriteTopics() {
     }
 
     favoriteTopics.swap(newTopics);
+    // Правила могли быть удалены, изменены или переставлены.
+    ruleAlertStates.clear();
+
+    // Сохраняем уже разобранный документ для MQTT callback.
+    alertWidgetsDoc = std::move(doc);
+
 
     // Удаляем из кэша состояния виджетов, которые больше не нужны.
     stateCache.erase(
@@ -248,15 +283,14 @@ void refreshFavoriteTopics() {
 // Проверка и отправка оповещений в MAX для избранных топиков
 // Проверка и отправка оповещений в MAX для избранных топиков
 void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int length) {
-    SystemSettings s = Settings::get();
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, s.widgetsJson);
-    if (err || !doc.is<JsonArray>()) return;
+    if (!alertWidgetsDoc.is<JsonArray>()) {
+        return;
+    }
 
     String payloadStr = "";
     for (unsigned int i = 0; i < length; ++i) payloadStr += (char)payload[i];
 
-    for (JsonObject w : doc.as<JsonArray>()) {
+    for (JsonObject w : alertWidgetsDoc.as<JsonArray>()) {
         String wTopic = w["topic"].as<String>();
         String baseTopic = wTopic;
         if (baseTopic.indexOf('#') >= 0) {
@@ -298,7 +332,14 @@ void checkAndSendMaxAlert(const char* topic, const byte* payload, unsigned int l
 
             RuleAlertState* ast = findRuleAlertState(topic, ruleIdx);
             if (!ast) {
+                if (ruleAlertStates.size() >= MAX_RULE_ALERT_STATES) {
+                    Serial.println("[MAX ALERT] Достигнут лимит состояний правил");
+                    ++ruleIdx;
+                    continue;
+                }
+
                 RuleAlertState newAst;
+                
                 newAst.topic = topic;
                 newAst.ruleIndex = ruleIdx;
                 newAst.lastValue = currentVal;
@@ -417,14 +458,13 @@ bool saveStateToCache(
             return false;
         }
 
-        CachedState newState{};
-        newState.used = true;
-
-        strncpy(newState.topic, topic, MAX_TOPIC_LENGTH);
-        newState.topic[MAX_TOPIC_LENGTH] = '\0';
-
-        stateCache.push_back(newState);
+        stateCache.emplace_back();
         state = &stateCache.back();
+
+        state->used = true;
+
+        strncpy(state->topic, topic, MAX_TOPIC_LENGTH);
+        state->topic[MAX_TOPIC_LENGTH] = '\0';
     }
 
     if (length > 0) {
@@ -434,17 +474,80 @@ bool saveStateToCache(
     state->payload[length] = '\0';
     state->updatedAt = millis();
 
-     // Запись точки в историю для графиков (раз в 30 минут = 1800000 мс)
-    String payloadStr = "";
-    for (unsigned int i = 0; i < length; ++i) payloadStr += (char)payload[i];
-    float currentVal = payloadStr.toFloat();
-    unsigned long now = millis();
+    // Историю записываем только для обычного числового payload.
+    // JSON и текстовые значения не превращаем ошибочно в 0.
+    char* end = nullptr;
+    const char* start = state->payload;
 
-    if (state->history.empty() || (now - state->history.back().timestamp >= HISTORY_INTERVAL_MS)) {
-        if (state->history.size() >= MAX_HISTORY_POINTS) {
-            state->history.erase(state->history.begin());
+    float currentVal = strtof(start, &end);
+
+    while (end != nullptr &&
+        *end != '\0' &&
+        std::isspace(static_cast<unsigned char>(*end))) {
+        ++end;
+    }
+
+    const bool isNumeric =
+        end != start &&
+        end != nullptr &&
+        *end == '\0' &&
+        std::isfinite(currentVal);
+
+    const unsigned long now = millis();
+
+    if (isNumeric) {
+        // Выделяем память истории один раз.
+        if (!state->history) {
+            size_t allocatedHistories = 0;
+
+            for (const CachedState& cached : stateCache) {
+                if (cached.history) {
+                    ++allocatedHistories;
+                }
+            }
+
+            const size_t historyBytes =
+                sizeof(HistoryPoint) * MAX_HISTORY_POINTS;
+
+            // 40 КБ — защитный запас, а не гарантия,
+            // что HTTPS или другие операции успешно выделят память.
+            if (allocatedHistories < MAX_HISTORY_TOPICS &&
+                ESP.getFreeHeap() > historyBytes + 40000UL) {
+
+                state->history.reset(
+                    new (std::nothrow) HistoryPoint[MAX_HISTORY_POINTS]
+                );
+
+                if (!state->history) {
+                    Serial.printf(
+                        "[HISTORY] Не удалось выделить память для %s\n",
+                        state->topic
+                    );
+                }
+            }
         }
-        state->history.push_back({currentVal, now});
+
+        if (state->history &&
+            (state->historyCount == 0 ||
+            now - state->historyLastAt >= HISTORY_INTERVAL_MS)) {
+
+            size_t index;
+
+            if (state->historyCount < MAX_HISTORY_POINTS) {
+                index = (state->historyStart + state->historyCount)
+                        % MAX_HISTORY_POINTS;
+
+                ++state->historyCount;
+            } else {
+                // Перезаписываем самую старую точку.
+                index = state->historyStart;
+                state->historyStart =
+                    (state->historyStart + 1) % MAX_HISTORY_POINTS;
+            }
+
+            state->history[index] = {currentVal, now};
+            state->historyLastAt = now;
+        }
     }
 
     // Проверяем условия и отправляем оповещение MAX
@@ -496,9 +599,9 @@ void onLocalMqttMessage(
     byte* payload,
     unsigned int length
 ) {
-    // Не пересылаем команды обратно на главный брокер:
-    // это защищает от петли main -> local -> main.
-    if (startsWith(topic, "cmnd/")) {
+    // Команды, поступившие с главного брокера, нельзя возвращать обратно.
+    // Иначе /set и /command могут образовать бесконечную MQTT-петлю.
+    if (isCommandTopic(topic)) {
         return;
     }
 
@@ -535,8 +638,7 @@ void onLocalMqttMessage(
 
 void onMainMqttMessage(char* topic, byte* payload, unsigned int length) {
     // Пропускаем все телеметрические статусы и state, оставляем только команды
-    String t = String(topic);
-    if (!t.startsWith("cmnd/") && !t.endsWith("/command") && !t.endsWith("/set")) {
+    if (!isCommandTopic(topic)) {
         return;
     }
 
@@ -908,20 +1010,20 @@ void setup() {
         updateLedIndicator();
 
         if (millis() - startedAt >= WIFI_CONNECT_TIMEOUT_MS) {
-            Serial.println("[WIFI] Таймаут. Режим настройки.");
-
-            if (!startSetupAccessPoint()) {
-                Serial.println(
-                    "[AP] Ошибка запуска. Перезагрузите устройство."
-                );
-            }
-
-            return;
+            Serial.println(
+                "[WIFI] Таймаут первоначального подключения. "
+                "Продолжаем автоматическое переподключение."
+            );
+            break;
         }
 
         delay(50);
     }
 
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+        
     Serial.printf(
         "[WIFI] Подключён. IP: %s\n",
         WiFi.localIP().toString().c_str()
@@ -934,7 +1036,9 @@ void setup() {
 }
 
 void processPendingAlerts() {
-    if (pendingAlerts.empty()) {
+    if (pendingAlerts.empty() ||
+        isApMode ||
+        WiFi.status() != WL_CONNECTED) {
         return;
     }
 
@@ -959,8 +1063,20 @@ bool sendMaxNotification(const String& message) {
         return false;
     }
 
-    if (ESP.getFreeHeap() < 40000) {
-        Serial.println("[MAX] Слишком мало памяти для безопасного соединения, пропуск отправки.");
+    const size_t freeInternal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    const size_t largestInternal =
+        heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+
+    if (freeInternal < 50000 || largestInternal < 16000) {
+        Serial.printf(
+            "[MAX] Отправка пропущена: internal=%u, largest=%u\n",
+            static_cast<unsigned>(freeInternal),
+            static_cast<unsigned>(largestInternal)
+        );
         return false;
     }
 
@@ -971,8 +1087,11 @@ bool sendMaxNotification(const String& message) {
     {
         WiFiClientSecure secureClient;
         secureClient.setInsecure(); // Пропуск проверки сертификата
+        secureClient.setHandshakeTimeout(5);
 
         HTTPClient https;
+        https.setConnectTimeout(5000);
+        https.setTimeout(5000);
         String url = "https://platform-api.max.ru/messages?user_id=" + s.maxUserId;
 
         Serial.printf("[MAX] Отправка запроса (свободно RAM: %u)...\n", ESP.getFreeHeap());

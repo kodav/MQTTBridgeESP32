@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 // Значения по умолчанию (используются при первом запуске или сбросе)
 constexpr const char* DEFAULT_WIFI_SSID = "";
@@ -38,6 +39,10 @@ constexpr int LED_PIN = 2;
 constexpr const char* DEFAULT_MAX_TOKEN = "";
 constexpr const char* DEFAULT_MAX_USER_ID = "";
 
-// Шаг 1 минута (60000 мс), храним 360 точек (6 часов истории)
-constexpr unsigned long HISTORY_INTERVAL_MS = 60000UL; 
+// История: одна точка в минуту, до 6 часов.
+constexpr unsigned long HISTORY_INTERVAL_MS = 60000UL;
 constexpr size_t MAX_HISTORY_POINTS = 360;
+
+// Максимум топиков, которым выделяется буфер истории.
+// Остальные виджеты работают без графика.
+constexpr size_t MAX_HISTORY_TOPICS = 12;
