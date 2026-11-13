@@ -18,6 +18,7 @@
 #include <new>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
 #include "Settings.h"
@@ -32,6 +33,8 @@ using namespace mqttBrokerName;
 // Максимальное количество разных топиков избранных виджетов.
 // Память под состояния выделяется по мере получения данных.
 constexpr size_t MAX_FAVORITE_TOPICS = 48;
+
+constexpr uint32_t WATCHDOG_TIMEOUT_S = 120;
 
 // На разных ревизиях плат полярность LED может отличаться.
 // Если светодиод работает наоборот, замените на false.
@@ -835,10 +838,12 @@ void publishCachedStatesToMain() {
         );
 
         if (!ok) {
+            mainNetworkClient.stop();
             Serial.printf(
                 "[MAIN MQTT] Не удалось восстановить состояние: %s\n",
                 state.topic
             );
+            return;
         }
     }
 }
@@ -872,6 +877,11 @@ void onLocalMqttMessage(
         );
 
         if (!ok) {
+            // Сообщение помещалось в буфер, значит отказ — это проблема канала.
+            // Закрываем сокет, чтобы следующие сообщения не ждали таймаут.
+            if (strlen(topic) + length + 7 <= MQTT_BUFFER_SIZE) {
+                mainNetworkClient.stop();
+            }
             Serial.printf(
                 "[MAIN MQTT] Не удалось переслать %s (%u байт)\n",
                 topic,
@@ -1214,17 +1224,36 @@ bool startSetupAccessPoint() {
     return true;
 }
 
+void setupWatchdog() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    esp_task_wdt_config_t config = {};
+    config.timeout_ms = WATCHDOG_TIMEOUT_S * 1000;
+    config.idle_core_mask = 0;
+    config.trigger_panic = true;
+
+    if (esp_task_wdt_reconfigure(&config) != ESP_OK) {
+        esp_task_wdt_init(&config);
+    }
+#else
+    esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);
+#endif
+    esp_task_wdt_add(NULL);
+}
+
 // ============================================================
 // Arduino setup / loop
 // ============================================================
-
 void setup() {
     Serial.begin(115200);
+    setupWatchdog();
 
     pinMode(LED_PIN, OUTPUT);
     writeLed(false);
 
     Settings::init();
+    // Выделяем память под кэш один раз при старте.
+    stateCache.reserve(MAX_FAVORITE_TOPICS);
+    pendingAlerts.reserve(MAX_PENDING_ALERTS);
 
     SystemSettings settings = Settings::get();
 
@@ -1283,6 +1312,12 @@ void setup() {
     }
 }
 
+// После неудачной отправки делаем паузу, чтобы не блокировать loop()
+// повторными HTTPS-попытками при отсутствии интернета.
+constexpr unsigned long MAX_FAIL_PAUSE_MS = 300000UL; // 5 минут
+bool maxSendPaused = false;
+unsigned long maxSendPausedAt = 0;
+
 void processPendingAlerts() {
     if (!ENABLE_MAX_NOTIFICATIONS) {
         pendingAlerts.clear();
@@ -1295,18 +1330,31 @@ void processPendingAlerts() {
         return;
     }
 
-    unsigned long now = millis();
-    // Отправляем не чаще чем раз в 3 секунды, чтобы не перегружать сетевой стек и Wi-Fi
-    if (now - lastAlertProcessTime > 3000UL) {
-        lastAlertProcessTime = now;
-        
-        // Берем первое сообщение из очереди
-        String msg = pendingAlerts.front();
-        pendingAlerts.erase(pendingAlerts.begin());
+    const unsigned long now = millis();
 
-        // Выполняем HTTPS-запрос в фоне (вне MQTT callback)
-        sendMaxNotification(msg);
+    if (maxSendPaused) {
+        if (now - maxSendPausedAt < MAX_FAIL_PAUSE_MS) {
+            pendingAlerts.clear();
+            return;
+        }
+        maxSendPaused = false;
     }
+
+    if (now - lastAlertProcessTime <= 3000UL) {
+        return;
+    }
+
+    String msg = pendingAlerts.front();
+    pendingAlerts.erase(pendingAlerts.begin());
+
+    if (!sendMaxNotification(msg)) {
+        maxSendPaused = true;
+        maxSendPausedAt = millis();
+        pendingAlerts.clear();
+    }
+
+    // Интервал отсчитываем от конца запроса, а не от начала.
+    lastAlertProcessTime = millis();
 }
 
 bool sendMaxNotification(const String& message) {
@@ -1433,6 +1481,7 @@ void publishGatewayHealth() {
 }
 
 void loop() {
+    esp_task_wdt_reset();
     // Индикатор работает также при отсутствии Wi-Fi и в режиме AP.
     updateLedIndicator();
     processPendingAlerts(); // Фоновая отправка оповещений MAX без блокировки MQTT

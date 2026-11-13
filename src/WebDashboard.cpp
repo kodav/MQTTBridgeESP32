@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <cstring>
 #include <ElegantOTA.h>
+#include <esp_task_wdt.h>
 
 namespace {
 
@@ -861,7 +862,7 @@ async function loadSettings() {
         console.error("Ошибка загрузки настроек:", e);
     }
 }
-    
+
 document.getElementById("settingsForm").addEventListener("submit", async function(e) {
     e.preventDefault();
     const res = document.getElementById("settingsResult");
@@ -1006,7 +1007,7 @@ void handleStatus() {
 }
 
 void handleGetWidgets() {
-    server.send(200, "application/json; charset=utf-8", Settings::get().widgetsJson);
+    server.send(200, "application/json; charset=utf-8", Settings::widgetsJson());
 }
 
 void handlePostWidgets() {
@@ -1273,6 +1274,11 @@ namespace WebDashboard {
         isConfigMode = apMode;
 
         ElegantOTA.begin(&server);
+        // Во время загрузки прошивки loop() не выполняется.
+        ElegantOTA.onProgress([](size_t, size_t) {
+            esp_task_wdt_reset();
+        });
+
 
         server.on("/", HTTP_GET, handleDashboard);
         server.on("/api/status", HTTP_GET, handleStatus);
