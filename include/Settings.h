@@ -30,5 +30,8 @@ namespace Settings {
     // Доступ к JSON виджетов без копирования всей структуры
     const String& widgetsJson();
 
+    // Общий переключатель истории графиков.
+    bool historyEnabled();
+    bool saveHistoryEnabled(bool enabled);
     void saveMax(const String& token, const String& userId);
 }

@@ -4,6 +4,8 @@
 
 Preferences preferences;
 SystemSettings currentSettings;
+// По умолчанию сохраняем прежнее поведение.
+static bool historyEnabledValue = true;
 
 namespace Settings {
 const String& widgetsJson() {
@@ -34,6 +36,8 @@ void init() {
 
     currentSettings.maxToken = preferences.getString("max_token", DEFAULT_MAX_TOKEN);
     currentSettings.maxUserId = preferences.getString("max_userid", DEFAULT_MAX_USER_ID);
+
+    historyEnabledValue = preferences.getBool("history_on", true);
 
     preferences.end();
 }
@@ -72,6 +76,25 @@ void saveWidgets(const String& widgetsJson) {
     currentSettings.widgetsJson = widgetsJson;
 }
 
+bool historyEnabled() {
+    return historyEnabledValue;
+}
+
+bool saveHistoryEnabled(bool enabled) {
+    if (!preferences.begin("gateway", false)) {
+        return false;
+    }
+
+    const size_t written = preferences.putBool("history_on", enabled);
+    preferences.end();
+
+    if (written != 1) {
+        return false;
+    }
+
+    historyEnabledValue = enabled;
+    return true;
+}
 
 // Новая функция сохранения настроек MAX:
 void saveMax(const String& token, const String& userId) {

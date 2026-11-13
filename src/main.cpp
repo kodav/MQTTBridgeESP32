@@ -53,6 +53,19 @@ PubSubClient mainMqtt(mainNetworkClient);
 std::vector<CachedState> stateCache;
 std::vector<JsonFieldHistory> jsonFieldHistories;
 
+// Освобождает историю всех датчиков, не удаляя текущие значения.
+void clearAllHistory() {
+    for (CachedState& state : stateCache) {
+        state.history.reset();
+        state.historyStart = 0;
+        state.historyCount = 0;
+        state.historyLastAt = 0;
+    }
+
+    // Удаляем историю JSON-полей и освобождаем память вектора.
+    std::vector<JsonFieldHistory>().swap(jsonFieldHistories);
+}
+
 // Считаем все выделенные буферы: обычные и для полей JSON.
 size_t countAllocatedHistories() {
     size_t count = 0;
@@ -702,84 +715,86 @@ bool saveStateToCache(
     state->payload[length] = '\0';
     state->updatedAt = millis();
 
-    // Историю записываем только для обычного числового payload.
-    // JSON и текстовые значения не превращаем ошибочно в 0.
-    char* end = nullptr;
-    const char* start = state->payload;
+    if (Settings::historyEnabled()) {
+        // Историю записываем только для обычного числового payload.
+        // JSON и текстовые значения не превращаем ошибочно в 0.
+        char* end = nullptr;
+        const char* start = state->payload;
 
-    float currentVal = strtof(start, &end);
+        float currentVal = strtof(start, &end);
 
-    while (end != nullptr &&
-        *end != '\0' &&
-        std::isspace(static_cast<unsigned char>(*end))) {
-        ++end;
-    }
+        while (end != nullptr &&
+            *end != '\0' &&
+            std::isspace(static_cast<unsigned char>(*end))) {
+            ++end;
+        }
 
-    const bool isNumeric =
-        end != start &&
-        end != nullptr &&
-        *end == '\0' &&
-        std::isfinite(currentVal);
+        const bool isNumeric =
+            end != start &&
+            end != nullptr &&
+            *end == '\0' &&
+            std::isfinite(currentVal);
 
-    const unsigned long now = millis();
+        const unsigned long now = millis();
 
-    if (isNumeric) {
-        // Выделяем память истории один раз.
-        if (!state->history) {
-            const size_t allocatedHistories = countAllocatedHistories();
+        if (isNumeric) {
+            // Выделяем память истории один раз.
+            if (!state->history) {
+                const size_t allocatedHistories = countAllocatedHistories();
 
-            const size_t historyBytes =
-                sizeof(HistoryPoint) * MAX_HISTORY_POINTS;
+                const size_t historyBytes =
+                    sizeof(HistoryPoint) * MAX_HISTORY_POINTS;
 
-            // 40 КБ — защитный запас, а не гарантия,
-            // что HTTPS или другие операции успешно выделят память.
-            if (allocatedHistories < MAX_HISTORY_TOPICS &&
-                ESP.getFreeHeap() > historyBytes + 40000UL) {
+                // 40 КБ — защитный запас, а не гарантия,
+                // что HTTPS или другие операции успешно выделят память.
+                if (allocatedHistories < MAX_HISTORY_TOPICS &&
+                    ESP.getFreeHeap() > historyBytes + 40000UL) {
 
-                state->history.reset(
-                    new (std::nothrow) HistoryPoint[MAX_HISTORY_POINTS]
-                );
-
-                if (!state->history) {
-                    Serial.printf(
-                        "[HISTORY] Не удалось выделить память для %s\n",
-                        state->topic
+                    state->history.reset(
+                        new (std::nothrow) HistoryPoint[MAX_HISTORY_POINTS]
                     );
+
+                    if (!state->history) {
+                        Serial.printf(
+                            "[HISTORY] Не удалось выделить память для %s\n",
+                            state->topic
+                        );
+                    }
                 }
             }
-        }
 
-        if (state->history &&
-            (state->historyCount == 0 ||
-            now - state->historyLastAt >= HISTORY_INTERVAL_MS)) {
+            if (state->history &&
+                (state->historyCount == 0 ||
+                now - state->historyLastAt >= HISTORY_INTERVAL_MS)) {
 
-            size_t index;
+                size_t index;
 
-            if (state->historyCount < MAX_HISTORY_POINTS) {
-                index = (state->historyStart + state->historyCount)
-                        % MAX_HISTORY_POINTS;
+                if (state->historyCount < MAX_HISTORY_POINTS) {
+                    index = (state->historyStart + state->historyCount)
+                            % MAX_HISTORY_POINTS;
 
-                ++state->historyCount;
-            } else {
-                // Перезаписываем самую старую точку.
-                index = state->historyStart;
-                state->historyStart =
-                    (state->historyStart + 1) % MAX_HISTORY_POINTS;
+                    ++state->historyCount;
+                } else {
+                    // Перезаписываем самую старую точку.
+                    index = state->historyStart;
+                    state->historyStart =
+                        (state->historyStart + 1) % MAX_HISTORY_POINTS;
+                }
+
+                state->history[index] = {currentVal, now};
+                state->historyLastAt = now;
             }
-
-            state->history[index] = {currentVal, now};
-            state->historyLastAt = now;
         }
-    }
 
-    // JSON для истории разбираем не чаще интервала записи истории.
-    if (!state->jsonHistoryAttempted ||
-        now - state->jsonHistoryLastAttempt >= HISTORY_INTERVAL_MS) {
+        // JSON для истории разбираем не чаще интервала записи истории.
+        if (!state->jsonHistoryAttempted ||
+            now - state->jsonHistoryLastAttempt >= HISTORY_INTERVAL_MS) {
 
-        state->jsonHistoryAttempted = true;
-        state->jsonHistoryLastAttempt = now;
+            state->jsonHistoryAttempted = true;
+            state->jsonHistoryLastAttempt = now;
 
-        recordJsonFieldHistories(topic, state->payload);
+            recordJsonFieldHistories(topic, state->payload);
+        }
     }
 
     // Правила MAX пока оставляем без изменений.

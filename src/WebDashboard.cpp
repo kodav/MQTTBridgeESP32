@@ -53,18 +53,6 @@ const char SETUP_HTML[] PROGMEM = R"HTML(
     <div id="result"></div>
 </div>
 <script>
-async function loadSettings() {
-    try {
-        const res = await fetch("/api/settings");
-        const data = await res.json();
-        document.getElementById("setSsid").value = data.ssid || "";
-        document.getElementById("setPass").value = data.pass || "";
-        document.getElementById("setMqttHost").value = data.host || "";
-        document.getElementById("setMqttPort").value = data.port || 1883;
-        document.getElementById("setMqttUser").value = data.user || "";
-        document.getElementById("setMqttPass").value = data.pass_mqtt || "";
-    } catch(e) {}
-}
 document.getElementById("settingsForm").addEventListener("submit", async function(e) {
     e.preventDefault();
     const res = document.getElementById("result");
@@ -221,6 +209,36 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
                 <button type="submit" class="action">Сохранить и перезагрузить</button>
             </form>
             <div id="settingsResult"></div>
+            <hr style="border:0; border-top:1px solid var(--border); margin:20px 0;">
+
+            <h2 class="panel-title">История датчиков</h2>
+
+            <form id="historySettingsForm">
+                <label style="display:flex; align-items:center; gap:10px;">
+                    <input
+                        id="historyEnabled"
+                        type="checkbox"
+                        style="width:auto; margin:0;"
+                    >
+                    Записывать историю для графиков
+                </label>
+
+                <div style="color:var(--muted); font-size:12px; margin:10px 0;">
+                    При отключении накопленная история удаляется из памяти.
+                </div>
+
+                <button
+                    type="submit"
+                    class="action"
+                    id="saveHistoryButton"
+                    disabled
+                >
+                    Сохранить
+                </button>
+            </form>
+
+            <div id="historySettingsResult"></div>
+
         </div>
     </section>
 
@@ -517,6 +535,16 @@ async function openChart(topic, label, unit) {
 
     try {
         const res = await fetch(`/api/history?topic=${encodeURIComponent(topic)}`);
+
+        if (res.status === 503) {
+            svg.innerHTML = '<text x="250" y="100" fill="#848996" text-anchor="middle">Запись истории отключена</text>';
+            return;
+        }
+
+        if (!res.ok) {
+            throw new Error("HTTP " + res.status);
+        }
+
         const data = await res.json();
 
         if (!Array.isArray(data) || data.length === 0) {
@@ -777,16 +805,63 @@ async function updateDashboard() {
 async function loadSettings() {
     try {
         const res = await fetch("/api/settings");
+        if (!res.ok) return;
         const data = await res.json();
-        document.getElementById("setSsid").value = data.ssid || "";
-        document.getElementById("setPass").value = data.pass || "";
-        document.getElementById("setMqttHost").value = data.host || "";
-        document.getElementById("setMqttPort").value = data.port || 1883;
-        document.getElementById("setMqttUser").value = data.user || "";
-        document.getElementById("setMqttPass").value = data.pass_mqtt || "";
-    } catch(e) {}
-}
 
+        // Поля страницы настроек дашборда
+        const setSsid = document.getElementById("setSsid");
+        if (setSsid) setSsid.value = data.ssid || "";
+
+        const setPass = document.getElementById("setPass");
+        if (setPass) setPass.value = data.pass || "";
+
+        const setMqttHost = document.getElementById("setMqttHost");
+        if (setMqttHost) setMqttHost.value = data.host || "";
+
+        const setMqttPort = document.getElementById("setMqttPort");
+        if (setMqttPort) setMqttPort.value = data.port || 1883;
+
+        const setMqttUser = document.getElementById("setMqttUser");
+        if (setMqttUser) setMqttUser.value = data.user || "";
+
+        const setMqttPass = document.getElementById("setMqttPass");
+        if (setMqttPass) setMqttPass.value = data.pass_mqtt || "";
+
+        // Поля страницы первоначальной настройки (AP)
+        const ssidInput = document.getElementById("ssidInput");
+        if (ssidInput) ssidInput.value = data.ssid || "";
+
+        const passInput = document.getElementById("passInput");
+        if (passInput) passInput.value = data.pass || "";
+
+        const mqttHostInput = document.getElementById("mqttHostInput");
+        if (mqttHostInput) mqttHostInput.value = data.host || "";
+
+        const mqttPortInput = document.getElementById("mqttPortInput");
+        if (mqttPortInput) mqttPortInput.value = data.port || 1883;
+
+        const mqttUserInput = document.getElementById("mqttUserInput");
+        if (mqttUserInput) mqttUserInput.value = data.user || "";
+
+        const mqttPassInput = document.getElementById("mqttPassInput");
+        if (mqttPassInput) mqttPassInput.value = data.pass_mqtt || "";
+
+        // Выключатель истории
+        const historyCheckbox = document.getElementById("historyEnabled");
+        if (historyCheckbox) {
+            historyCheckbox.checked = data.history_enabled === true;
+            historyCheckbox.dataset.saved = historyCheckbox.checked ? "1" : "0";
+        }
+
+        const saveHistoryButton = document.getElementById("saveHistoryButton");
+        if (saveHistoryButton) {
+            saveHistoryButton.disabled = false;
+        }
+    } catch (e) {
+        console.error("Ошибка загрузки настроек:", e);
+    }
+}
+    
 document.getElementById("settingsForm").addEventListener("submit", async function(e) {
     e.preventDefault();
     const res = document.getElementById("settingsResult");
@@ -801,6 +876,47 @@ document.getElementById("settingsForm").addEventListener("submit", async functio
         res.className = "ok";
     } catch(err) { res.textContent = "Ошибка: " + err; res.className = "error"; }
 });
+
+document.getElementById("historySettingsForm").addEventListener(
+    "submit",
+    async function(e) {
+        e.preventDefault();
+
+        const checkbox = document.getElementById("historyEnabled");
+        const button = document.getElementById("saveHistoryButton");
+        const result = document.getElementById("historySettingsResult");
+
+        const enabled = checkbox.checked;
+        button.disabled = true;
+        result.textContent = "Сохранение...";
+
+        try {
+            const response = await fetch("/api/history-setting", {
+                method: "POST",
+                body: new URLSearchParams({
+                    enabled: enabled ? "1" : "0"
+                })
+            });
+
+            const message = await response.text();
+
+            if (!response.ok) {
+                throw new Error(message || ("HTTP " + response.status));
+            }
+
+            checkbox.dataset.saved = enabled ? "1" : "0";
+            result.textContent = message;
+            result.className = "ok";
+        } catch (error) {
+            // При ошибке возвращаем последнее загруженное или сохранённое значение.
+            checkbox.checked = checkbox.dataset.saved === "1";
+            result.textContent = "Ошибка: " + error.message;
+            result.className = "error";
+        } finally {
+            button.disabled = false;
+        }
+    }
+);
 
 document.getElementById("commandForm").addEventListener(
     "submit",
@@ -937,6 +1053,7 @@ void handleGetSettings() {
     doc["port"] = s.mqttPort;
     doc["user"] = s.mqttUser;
     doc["pass_mqtt"] = s.mqttPassword;
+    doc["history_enabled"] = Settings::historyEnabled();
     String response;
     serializeJson(doc, response);
     server.send(200, "application/json; charset=utf-8", response);
@@ -1031,7 +1148,52 @@ void handleMaxTest() {
     }
 }
 
+void handlePostHistorySetting() {
+    if (!server.hasArg("enabled")) {
+        server.send(400, "text/plain; charset=utf-8", "Не указано состояние истории");
+        return;
+    }
+
+    const String value = server.arg("enabled");
+
+    if (value != "0" && value != "1") {
+        server.send(400, "text/plain; charset=utf-8", "Ожидается enabled=0 или enabled=1");
+        return;
+    }
+
+    const bool enabled = value == "1";
+
+    if (!Settings::saveHistoryEnabled(enabled)) {
+        server.send(500, "text/plain; charset=utf-8", "Не удалось сохранить настройку");
+        return;
+    }
+
+    if (!enabled) {
+        clearAllHistory();
+        server.send(
+            200,
+            "text/plain; charset=utf-8",
+            "История отключена, накопленные данные удалены"
+        );
+    } else {
+        server.send(
+            200,
+            "text/plain; charset=utf-8",
+            "История включена"
+        );
+    }
+}
+
 void handleHistory() {
+    if (!Settings::historyEnabled()) {
+        server.send(
+            503,
+            "text/plain; charset=utf-8",
+            "История отключена"
+        );
+        return;
+    }
+
     if (!server.hasArg("topic")) {
         server.send(400, "text/plain", "Missing topic");
         return;
@@ -1123,6 +1285,7 @@ namespace WebDashboard {
         server.on("/api/max-settings", HTTP_POST, handlePostMaxSettings);
         server.on("/api/max-test", HTTP_POST, handleMaxTest);
         server.on("/api/history", HTTP_GET, handleHistory);
+        server.on("/api/history-setting", HTTP_POST, handlePostHistorySetting);
         server.begin();
     }
 

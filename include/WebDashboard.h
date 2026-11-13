@@ -49,6 +49,8 @@ struct CachedState {
 
 // Глобальная функция отправки в MAX
 bool sendMaxNotification(const String& message);
+// Реализована в main.cpp.
+void clearAllHistory();
 
 namespace WebDashboard {
     void begin(
