@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <new>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 
 #include "config.h"
 #include "Settings.h"
@@ -771,9 +772,20 @@ bool saveStateToCache(
         }
     }
 
-    recordJsonFieldHistories(topic, state->payload);
-    // Проверяем условия и отправляем оповещение MAX
-    checkAndSendMaxAlert(topic, payload, length);
+    // JSON для истории разбираем не чаще интервала записи истории.
+    if (!state->jsonHistoryAttempted ||
+        now - state->jsonHistoryLastAttempt >= HISTORY_INTERVAL_MS) {
+
+        state->jsonHistoryAttempted = true;
+        state->jsonHistoryLastAttempt = now;
+
+        recordJsonFieldHistories(topic, state->payload);
+    }
+
+    // Правила MAX пока оставляем без изменений.
+    if (ENABLE_MAX_NOTIFICATIONS) {
+        checkAndSendMaxAlert(topic, payload, length);
+    }
 
     return true;
 }
@@ -854,7 +866,6 @@ void onLocalMqttMessage(
     }
 
     // 2. Только избранное сохраняем в оперативную память.
-    refreshFavoriteTopics();
     saveStateToCache(topic, payload, length);
 }
 
@@ -1258,6 +1269,11 @@ void setup() {
 }
 
 void processPendingAlerts() {
+    if (!ENABLE_MAX_NOTIFICATIONS) {
+        pendingAlerts.clear();
+        return;
+    }
+
     if (pendingAlerts.empty() ||
         isApMode ||
         WiFi.status() != WL_CONNECTED) {
@@ -1345,6 +1361,62 @@ bool sendMaxNotification(const String& message) {
     return success;
 }
 
+void publishGatewayHealth() {
+    if (!mainMqtt.connected()) {
+        return;
+    }
+
+    static unsigned long lastPublish = 0;
+    const unsigned long now = millis();
+
+    if (now - lastPublish < 60000UL) {
+        return;
+    }
+
+    lastPublish = now;
+
+    const size_t freeInternal = heap_caps_get_free_size(
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+    );
+
+    const size_t largestInternal = heap_caps_get_largest_free_block(
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+    );
+
+    char payload[240];
+
+    const int written = snprintf(
+        payload,
+        sizeof(payload),
+        "{\"uptime_s\":%lu,"
+        "\"free_heap\":%u,"
+        "\"min_free_heap\":%u,"
+        "\"free_internal\":%u,"
+        "\"largest_internal\":%u,"
+        "\"reset_reason\":%d,"
+        "\"local_mqtt\":%s}",
+        now / 1000UL,
+        static_cast<unsigned>(ESP.getFreeHeap()),
+        static_cast<unsigned>(ESP.getMinFreeHeap()),
+        static_cast<unsigned>(freeInternal),
+        static_cast<unsigned>(largestInternal),
+        static_cast<int>(esp_reset_reason()),
+        localMqtt.connected() ? "true" : "false"
+    );
+
+    if (written <= 0 ||
+        static_cast<size_t>(written) >= sizeof(payload)) {
+        return;
+    }
+
+    // Без retain: старое состояние не будет выдаваться как актуальное.
+    mainMqtt.publish(
+        "cottage/gateway/health",
+        payload,
+        false
+    );
+}
+
 void loop() {
     // Индикатор работает также при отсутствии Wi-Fi и в режиме AP.
     updateLedIndicator();
@@ -1357,10 +1429,29 @@ void loop() {
         return;
     }
 
+    // Если автоподключение Wi-Fi не восстановилось за 15 минут,
+    // перезапускаем ESP32 и начинаем подключение заново.
+    static bool wifiDisconnected = false;
+    static unsigned long wifiDisconnectedSince = 0;
+
     if (WiFi.status() != WL_CONNECTED) {
+        const unsigned long now = millis();
+
+        if (!wifiDisconnected) {
+            wifiDisconnected = true;
+            wifiDisconnectedSince = now;
+        }
+
+        if (now - wifiDisconnectedSince >= 15UL * 60UL * 1000UL) {
+            ESP.restart();
+        }
+
         delay(100);
         return;
     }
+
+    // Wi-Fi восстановился: сбрасываем таймер.
+    wifiDisconnected = false;
 
     if (!servicesStarted) {
         startServices();
@@ -1373,6 +1464,15 @@ void loop() {
 
     WebDashboard::handleClient();
 
+    // Обновляем конфигурацию виджетов не чаще раза в секунду.
+    static unsigned long lastWidgetsCheck = 0;
+    const unsigned long widgetsCheckNow = millis();
+
+    if (widgetsCheckNow - lastWidgetsCheck >= 1000UL) {
+        lastWidgetsCheck = widgetsCheckNow;
+        refreshFavoriteTopics();
+    }
+
     if (!localMqtt.connected()) {
         reconnectLocalMqtt();
     } else {
@@ -1384,6 +1484,8 @@ void loop() {
     } else {
         mainMqtt.loop();
     }
+
+    publishGatewayHealth();
 
     // Отслеживание изменения статуса главного MQTT-брокера с защитой от ложных срабатываний
     static unsigned long disconnectStartTime = 0;

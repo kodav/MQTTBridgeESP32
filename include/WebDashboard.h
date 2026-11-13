@@ -34,6 +34,10 @@ struct CachedState {
 
     unsigned long updatedAt = 0;
 
+    // Последняя попытка записать историю JSON-полей этого топика.
+    bool jsonHistoryAttempted = false;
+    unsigned long jsonHistoryLastAttempt = 0;
+
     // Память под историю выделяется только для числовых значений
     // и только при наличии свободного лимита.
     std::unique_ptr<HistoryPoint[]> history;

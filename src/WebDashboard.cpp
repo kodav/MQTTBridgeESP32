@@ -306,7 +306,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 <!-- Модальное окно графика -->
 <div id="chartModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; justify-content:center; align-items:center;">
     <div style="background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; width:90%; max-width:600px; position:relative;">
-        <h3 id="chartTitle" style="margin-top:0; color:var(--text); font-size:16px;">График за 24 часа</h3>
+        <h3 id="chartTitle" style="margin-top:0; color:var(--text); font-size:16px;">График до 6 часов</h3>
         <div id="chartContainer" style="width:100%; height:250px; display:flex; align-items:center; justify-content:center;">
             <svg id="sensorChart" width="100%" height="100%" viewBox="0 0 500 200" style="overflow:visible;"></svg>
         </div>
@@ -509,7 +509,7 @@ function renderDashboardWidgets() {
 }
 
 async function openChart(topic, label, unit) {
-    document.getElementById("chartTitle").textContent = label + " (24 часа)";
+    document.getElementById("chartTitle").textContent = label + " (до 6 часов)";
     document.getElementById("chartModal").style.display = "flex";
     
     const svg = document.getElementById("sensorChart");
@@ -838,7 +838,13 @@ async function initApp() {
     await loadWidgets();
     await updateDashboard();
     await loadMaxSettings();
-    setInterval(updateDashboard, 3000);
+    // Следующий запрос запускается только после завершения предыдущего.
+    async function pollDashboard() {
+        await updateDashboard();
+        setTimeout(pollDashboard, 10000);
+    }
+
+    setTimeout(pollDashboard, 10000);
 }
 
 initApp();
@@ -1008,6 +1014,15 @@ void handlePostMaxSettings() {
 }
 
 void handleMaxTest() {
+    if (!ENABLE_MAX_NOTIFICATIONS) {
+        server.send(
+            503,
+            "text/plain; charset=utf-8",
+            "MAX временно отключён в прошивке"
+        );
+        return;
+    }
+
     bool ok = sendMaxNotification("Тестовое уведомление от шлюза ESP32!");
     if (ok) {
         server.send(200, "text/plain", "Тестовое сообщение успешно отправлено в MAX!");

@@ -39,12 +39,16 @@ constexpr int LED_PIN = 2;
 constexpr const char* DEFAULT_MAX_TOKEN = "";
 constexpr const char* DEFAULT_MAX_USER_ID = "";
 
-// История: одна точка в минуту, до 6 часов.
-constexpr unsigned long HISTORY_INTERVAL_MS = 60000UL;
-constexpr size_t MAX_HISTORY_POINTS = 360;
+// История: одна точка не чаще раза в 2 минуты.
+// 180 точек — примерно 6 часов при регулярном поступлении сообщений.
+constexpr unsigned long HISTORY_INTERVAL_MS = 120000UL;
+constexpr size_t MAX_HISTORY_POINTS = 180;
 
-// Максимум топиков, которым выделяется буфер истории.
-// Остальные виджеты работают без графика.
+// Общий лимит обычных топиков и полей JSON.
 constexpr size_t MAX_HISTORY_TOPICS = 12;
 
-constexpr const char* FIRMWARE_VERSION = "v1.1.0";
+constexpr const char* FIRMWARE_VERSION = "v1.1.1";
+
+// Для проверки стабильности можно временно поставить false.
+// Настройки MAX и правила виджетов при этом сохраняются.
+constexpr bool ENABLE_MAX_NOTIFICATIONS = true;
