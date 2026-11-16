@@ -1085,6 +1085,170 @@ void reconnectLocalMqtt() {
 // Подключение к главному MQTT
 // ============================================================
 
+void addGatewayDevice(JsonDocument& doc) {
+    JsonObject device = doc["device"].to<JsonObject>();
+
+    JsonArray identifiers = device["identifiers"].to<JsonArray>();
+    identifiers.add("cottage_gateway_esp32");
+
+    device["name"] = "Cottage MQTT Gateway";
+    device["manufacturer"] = "ESP32";
+    device["model"] = "Cottage MQTT Gateway";
+    device["sw_version"] = "1.0";
+
+    doc["availability_topic"] = GATEWAY_AVAILABILITY_TOPIC;
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+}
+
+bool publishGatewaySensorDiscovery(
+    const char* objectId,
+    const char* name,
+    const char* valueTemplate,
+    const char* unit
+) {
+    char configTopic[160];
+
+    snprintf(
+        configTopic,
+        sizeof(configTopic),
+        "homeassistant/sensor/cottage_gateway/%s/config",
+        objectId
+    );
+
+    JsonDocument doc;
+
+    doc["name"] = name;
+    doc["unique_id"] = String("cottage_gateway_") + objectId;
+    doc["state_topic"] = "cottage/gateway/health";
+    doc["value_template"] = valueTemplate;
+    doc["entity_category"] = "diagnostic";
+    doc["state_class"] = "measurement";
+
+    if (unit != nullptr && unit[0] != '\0') {
+        doc["unit_of_measurement"] = unit;
+    }
+
+    addGatewayDevice(doc);
+
+    char payload[700];
+    const size_t length = serializeJson(doc, payload, sizeof(payload));
+
+    if (length == 0 || length >= sizeof(payload)) {
+        Serial.printf("[DISCOVERY] JSON не помещается: %s\n", objectId);
+        return false;
+    }
+
+    const bool ok = mainMqtt.publish(configTopic, payload, true);
+
+    Serial.printf(
+        "[DISCOVERY] %s: %s\n",
+        objectId,
+        ok ? "опубликовано" : "ошибка публикации"
+    );
+
+    return ok;
+}
+
+bool publishGatewayBinarySensorDiscovery(
+    const char* objectId,
+    const char* name,
+    const char* valueTemplate
+) {
+    char configTopic[160];
+
+    snprintf(
+        configTopic,
+        sizeof(configTopic),
+        "homeassistant/binary_sensor/cottage_gateway/%s/config",
+        objectId
+    );
+
+    JsonDocument doc;
+
+    doc["name"] = name;
+    doc["unique_id"] = String("cottage_gateway_") + objectId;
+    doc["state_topic"] = "cottage/gateway/health";
+    doc["value_template"] = valueTemplate;
+    doc["payload_on"] = "ON";
+    doc["payload_off"] = "OFF";
+    doc["entity_category"] = "diagnostic";
+
+    addGatewayDevice(doc);
+
+    char payload[700];
+    const size_t length = serializeJson(doc, payload, sizeof(payload));
+
+    if (length == 0 || length >= sizeof(payload)) {
+        Serial.printf("[DISCOVERY] JSON не помещается: %s\n", objectId);
+        return false;
+    }
+
+    const bool ok = mainMqtt.publish(configTopic, payload, true);
+
+    Serial.printf(
+        "[DISCOVERY] %s: %s\n",
+        objectId,
+        ok ? "опубликовано" : "ошибка публикации"
+    );
+
+    return ok;
+}
+
+void publishGatewayDiscovery() {
+    if (!mainMqtt.connected()) {
+        return;
+    }
+
+    publishGatewaySensorDiscovery(
+        "free_heap",
+        "Free Heap",
+        "{{ value_json.free_heap }}",
+        "B"
+    );
+
+    publishGatewaySensorDiscovery(
+        "min_free_heap",
+        "Minimum Free Heap",
+        "{{ value_json.min_free_heap }}",
+        "B"
+    );
+
+    publishGatewaySensorDiscovery(
+        "free_internal",
+        "Free Internal RAM",
+        "{{ value_json.free_internal }}",
+        "B"
+    );
+
+    publishGatewaySensorDiscovery(
+        "largest_internal",
+        "Largest Internal RAM Block",
+        "{{ value_json.largest_internal }}",
+        "B"
+    );
+
+    publishGatewaySensorDiscovery(
+        "uptime",
+        "Uptime",
+        "{{ value_json.uptime_s }}",
+        "s"
+    );
+
+    publishGatewaySensorDiscovery(
+        "reset_reason",
+        "Reset Reason",
+        "{{ value_json.reset_reason }}",
+        ""
+    );
+
+    publishGatewayBinarySensorDiscovery(
+        "local_mqtt",
+        "Local MQTT",
+        "{{ 'ON' if value_json.local_mqtt else 'OFF' }}"
+    );
+}
+
 void reconnectMainMqtt() {
     if (mainMqtt.connected()) {
         return;
@@ -1160,6 +1324,7 @@ void reconnectMainMqtt() {
         Serial.println("[MAIN MQTT] Ошибка публикации availability");
     }
 
+    publishGatewayDiscovery();
     publishCachedStatesToMain();
 }
 

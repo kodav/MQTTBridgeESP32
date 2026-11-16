@@ -47,8 +47,9 @@ constexpr size_t MAX_HISTORY_POINTS = 180;
 // Общий лимит обычных топиков и полей JSON.
 constexpr size_t MAX_HISTORY_TOPICS = 12;
 
-constexpr const char* FIRMWARE_VERSION = "v1.1.1";
+constexpr const char* FIRMWARE_VERSION = "v1.1.2";
 
 // Для проверки стабильности можно временно поставить false.
 // Настройки MAX и правила виджетов при этом сохраняются.
 constexpr bool ENABLE_MAX_NOTIFICATIONS = true;
+
