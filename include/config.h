@@ -33,9 +33,6 @@ constexpr uint16_t MQTT_BUFFER_SIZE = 1024;
 
 constexpr unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000;
 
-// Встроенный светодиод на большинстве плат ESP32 (NodeMCU / DevKit) — это GPIO 2
-constexpr int LED_PIN = 2;
-
 constexpr const char* DEFAULT_MAX_TOKEN = "";
 constexpr const char* DEFAULT_MAX_USER_ID = "";
 
@@ -47,9 +44,9 @@ constexpr size_t MAX_HISTORY_POINTS = 180;
 // Общий лимит обычных топиков и полей JSON.
 constexpr size_t MAX_HISTORY_TOPICS = 12;
 
-constexpr const char* FIRMWARE_VERSION = "v1.1.2";
+constexpr const char* FIRMWARE_VERSION = "v1.1.3";
 
 // Для проверки стабильности можно временно поставить false.
 // Настройки MAX и правила виджетов при этом сохраняются.
-constexpr bool ENABLE_MAX_NOTIFICATIONS = true;
+constexpr bool ENABLE_MAX_NOTIFICATIONS = false;
 

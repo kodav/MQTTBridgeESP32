@@ -928,38 +928,6 @@ void onMainMqttMessage(char* topic, byte* payload, unsigned int length) {
 }
 
 // ============================================================
-// Светодиод
-// ============================================================
-
-void writeLed(bool enabled) {
-    const uint8_t level = LED_ACTIVE_HIGH
-        ? (enabled ? HIGH : LOW)
-        : (enabled ? LOW : HIGH);
-
-    digitalWrite(LED_PIN, level);
-}
-
-void updateLedIndicator() {
-    static unsigned long lastToggle = 0;
-    static bool ledOn = false;
-
-    const unsigned long now = millis();
-
-    // MQTT подключён: переключение каждые 2 секунды.
-    // MQTT недоступен, Wi-Fi недоступен или AP: каждые 300 мс.
-    const unsigned long interval =
-        (WiFi.status() == WL_CONNECTED && mainMqtt.connected())
-            ? 2000UL
-            : 300UL;
-
-    if (now - lastToggle >= interval) {
-        lastToggle = now;
-        ledOn = !ledOn;
-        writeLed(ledOn);
-    }
-}
-
-// ============================================================
 // Запуск сервисов
 // ============================================================
 
@@ -1412,9 +1380,6 @@ void setup() {
     Serial.begin(115200);
     setupWatchdog();
 
-    pinMode(LED_PIN, OUTPUT);
-    writeLed(false);
-
     Settings::init();
     // Выделяем память под кэш один раз при старте.
     stateCache.reserve(MAX_FAVORITE_TOPICS);
@@ -1449,8 +1414,6 @@ void setup() {
     const unsigned long startedAt = millis();
 
     while (WiFi.status() != WL_CONNECTED) {
-        updateLedIndicator();
-
         if (millis() - startedAt >= WIFI_CONNECT_TIMEOUT_MS) {
             Serial.println(
                 "[WIFI] Таймаут первоначального подключения. "
@@ -1647,8 +1610,6 @@ void publishGatewayHealth() {
 
 void loop() {
     esp_task_wdt_reset();
-    // Индикатор работает также при отсутствии Wi-Fi и в режиме AP.
-    updateLedIndicator();
     processPendingAlerts(); // Фоновая отправка оповещений MAX без блокировки MQTT
 
     if (isApMode) {
