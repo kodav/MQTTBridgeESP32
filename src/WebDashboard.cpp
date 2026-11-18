@@ -1,1013 +1,630 @@
 #include "WebDashboard.h"
 #include "Settings.h"
+#include "config.h"
+
+#include <Arduino.h>
+#include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ArduinoJson.h>
-#include <cstring>
 #include <ElegantOTA.h>
-#include <esp_task_wdt.h>
+#include <cstring>
 
 namespace {
 
 WebServer server(80);
+
 PubSubClient* localMqttClient = nullptr;
 PubSubClient* mainMqttClient = nullptr;
-std::vector<CachedState>* cachedStates = nullptr;
-size_t cachedStateCount = 0;
-bool isConfigMode = false;
 
-// HTML настройки (AP)
-const char SETUP_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Настройка шлюза</title>
-    <style>
-        :root { color-scheme: dark; --background: #101116; --panel: #181a22; --card: #111319; --border: #242731; --text: #e2e4eb; --accent: #78d594; --error: #f27d83; }
-        body { margin: 0; background: var(--background); color: var(--text); font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 16px; box-sizing: border-box; }
-        .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 24px; width: 100%; max-width: 400px; }
-        h2 { margin-top: 0; font-size: 18px; color: var(--accent); text-align: center; }
-        input, button { width: 100%; border-radius: 5px; font: inherit; box-sizing: border-box; }
-        input { display: block; padding: 10px; margin: 6px 0 14px; color: var(--text); background: var(--card); border: 1px solid #353945; }
-        button { padding: 12px; background: #2a6140; color: white; border: none; cursor: pointer; font-weight: bold; }
-        button:hover { background: #34774d; }
-        label { color: #b9bdc8; font-size: 12px; }
-        #result { margin-top: 12px; text-align: center; font-size: 13px; }
-        #result.ok { color: var(--accent); }
-        #result.error { color: var(--error); }
-    </style>
-</head>
-<body>
-<div class="panel">
-    <h2>Настройка шлюза</h2>
-    <form id="settingsForm">
-        <label>Имя Wi-Fi сети (SSID)</label><input id="setSsid" required>
-        <label>Пароль Wi-Fi</label><input id="setPass" type="password">
-        <label>Хост главного MQTT</label><input id="setMqttHost" required>
-        <label>Порт главного MQTT</label><input id="setMqttPort" type="number" value="1883" required>
-        <label>Пользователь MQTT</label><input id="setMqttUser">
-        <label>Пароль MQTT</label><input id="setMqttPass" type="password">
-        <button type="submit">Сохранить и перезагрузить</button>
-    </form>
-    <div id="result"></div>
-</div>
-<script>
-document.getElementById("settingsForm").addEventListener("submit", async function(e) {
-    e.preventDefault();
-    const res = document.getElementById("result");
-    const body = new URLSearchParams({
-        ssid: document.getElementById("setSsid").value, pass: document.getElementById("setPass").value,
-        host: document.getElementById("setMqttHost").value, port: document.getElementById("setMqttPort").value,
-        user: document.getElementById("setMqttUser").value, pass_mqtt: document.getElementById("setMqttPass").value
-    });
-    try {
-        const response = await fetch("/api/settings", { method: "POST", body });
-        res.textContent = await response.text();
-        res.className = "ok";
-        setTimeout(() => location.reload(), 4000);
-    } catch(err) { res.textContent = "Ошибка: " + err; res.className = "error"; }
-});
-</script>
-</body>
-</html>
-)HTML";
+CachedState* cachedStates = nullptr;
+size_t cachedStateCapacity = 0;
+bool isApMode = false;
+bool serverStarted = false;
 
-// Основной дашборд с кастомизацией виджетов
 const char DASHBOARD_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>MQTT Gateway</title>
-    <style>
-        :root { color-scheme: dark; --background: #101116; --header: #0d0e12; --panel: #181a22; --card: #111319; --border: #242731; --text: #e2e4eb; --muted: #848996; --accent: #78d594; --error: #f27d83; --blue: #4a90e2; }
-        * { box-sizing: border-box; }
-        body { margin: 0; background: var(--background); color: var(--text); font-family: Arial, sans-serif; font-size: 14px; }
-        header { min-height: 54px; display: flex; align-items: center; justify-content: space-between; padding: 10px 22px; background: var(--header); border-bottom: 1px solid var(--border); }
-        .brand { font-size: 12px; font-weight: bold; text-transform: uppercase; }
-        .header-status { color: var(--muted); font-size: 12px; }
-        .header-status.ok { color: var(--accent); }
-        .header-status.error { color: var(--error); }
-        main { max-width: 1160px; margin: 26px auto; padding: 0 16px 30px; }
-        .tabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
-        .tab-button { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 12px 16px; cursor: pointer; font-size: 13px; }
-        .tab-button.active { color: var(--text); border-bottom-color: var(--accent); }
-        .tab-panel { display: none; }
-        .tab-panel.active { display: block; }
-        .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-        .panel-title { margin: 0 0 14px; color: #a9adb9; font-size: 11px; font-weight: bold; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; }
-        
-        .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-        @media(max-width: 900px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-        
-        .card { padding: 14px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; position: relative; }
-        .card-label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
-        .card-value { margin-top: 8px; font-size: 20px; font-weight: bold; word-break: break-all; }
-        .card-value.small { font-size: 14px; }
-        .card-subtitle { margin-top: 6px; color: var(--muted); font-size: 10px; word-break: break-all; }
-        .card-value.negative { color: var(--error); }
-        
-        .btn-switch { margin-top: 10px; width: 100%; padding: 8px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; cursor: pointer; font-weight: bold; }
-        .btn-switch.on { background: #2a6140; border-color: #3b8057; }
-
-        .table-wrap { overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
-        th, td { padding: 10px; border-bottom: 1px solid var(--border); text-align: left; overflow: hidden; text-overflow: ellipsis; word-wrap: break-word; }
-        th { color: var(--muted); font-size: 10px; text-transform: uppercase; }
-        td:nth-child(1) { width: 45%; }
-        td:nth-child(2) { width: 45%; word-break: break-all; }
-        td:nth-child(3) { width: 10%; white-space: nowrap; }
-
-        input, select, textarea, button.action { width: 100%; border-radius: 5px; font: inherit; }
-        input, select, textarea { display: block; padding: 10px; margin: 6px 0 12px; color: var(--text); background: var(--card); border: 1px solid #353945; }
-        button.action { width: auto; padding: 10px 18px; background: #2a6140; color: white; border: 1px solid #3b8057; cursor: pointer; }
-        button.action:hover { background: #34774d; }
-        button.danger { background: #8b2626; border-color: #a83232; }
-        label { color: #b9bdc8; font-size: 12px; }
-        
-        .widget-row { display: flex; gap: 8px; align-items: center; background: var(--card); padding: 8px; border: 1px solid var(--border); border-radius: 5px; margin-bottom: 8px; }
-        .widget-row span { flex-grow: 1; font-size: 13px; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cottage Gateway</title>
+<style>
+:root{color-scheme:dark;--bg:#101116;--panel:#181a22;--card:#111319;--border:#30333d;--text:#e2e4eb;--muted:#9297a5;--green:#78d594;--red:#f27d83}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px Arial,sans-serif}
+header{padding:14px 20px;background:#0d0e12;border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
+main{max-width:1100px;margin:20px auto;padding:0 14px}
+nav{display:flex;gap:5px;flex-wrap:wrap;border-bottom:1px solid var(--border);margin-bottom:14px}
+nav button,.action{background:#2a6140;color:white;border:0;border-radius:5px;padding:10px 14px;cursor:pointer}
+nav button{background:transparent;color:var(--muted);border-radius:0}
+nav button.active{color:var(--text);border-bottom:2px solid var(--green)}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin:12px 0}
+.panel h2{font-size:13px;text-transform:uppercase;color:#a9adb9;margin:0 0 14px}
+.tab{display:none}.tab.active{display:block}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media(max-width:750px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:13px;min-width:0}
+.label{font-size:11px;color:var(--muted);text-transform:uppercase;overflow-wrap:anywhere}
+.value{font-size:20px;font-weight:bold;margin-top:8px;overflow-wrap:anywhere}
+.small{font-size:14px}
+.muted{color:var(--muted)}
+input,select,textarea{display:block;width:100%;padding:9px;margin:5px 0 12px;background:var(--card);color:var(--text);border:1px solid #454956;border-radius:5px;font:inherit}
+label{font-size:12px;color:#b9bdc8}
+textarea{min-height:70px}
+.action{margin:4px 3px 4px 0}
+.danger{background:#8b2626}
+.switch{margin-top:10px;width:100%;padding:8px;background:#333;color:white;border:1px solid #555;border-radius:4px;cursor:pointer}
+.switch.on{background:#2a6140}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+th,td{text-align:left;padding:8px;border-bottom:1px solid var(--border);overflow-wrap:anywhere;vertical-align:top}
+th{color:var(--muted);font-size:11px}
+.widget-row{display:flex;gap:8px;align-items:center;padding:8px;border:1px solid var(--border);margin:7px 0;border-radius:5px}
+.widget-row span{flex:1;overflow-wrap:anywhere}
+.result{white-space:pre-wrap;margin-top:8px}
+</style>
 </head>
 <body>
 <header>
-    <div class="brand">
-        MQTT Gateway
-        <div class="card-value small" id="fwVersion">—</div>
-    </div>
-    
-</div>
-    <a href="/update" style="color: var(--muted); text-decoration: none; font-size: 12px; transition: color 0.2s;" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Прошивка (OTA) &rarr;</a>
+  <div><b>MQTT Gateway</b> <span id="version" class="muted"></span></div>
+  <a href="/update" style="color:#78d594">OTA</a>
 </header>
 <main>
-    <nav class="tabs">
-        <button type="button" class="tab-button active" data-tab="dashboard">Дашборд</button>
-        <button type="button" class="tab-button" data-tab="mqtt">MQTT</button>
-        <button type="button" class="tab-button" data-tab="control">Управление</button>
-        <button type="button" class="tab-button" data-tab="settings">Настройки</button>
-        <button type="button" class="tab-button" data-tab="dashconfig">⚙️ Настройка дашборда</button>
-        <button type="button" class="tab-button" data-tab="max">📢 MAX</button>
-    </nav>
+<nav>
+  <button class="active" data-tab="dashboard">Дашборд</button>
+  <button data-tab="mqtt">Последние значения</button>
+  <button data-tab="control">Управление</button>
+  <button data-tab="widgets">Виджеты</button>
+  <button data-tab="settings">Настройки</button>
+</nav>
 
-    <!-- Дашборд -->
-    <section id="tab-dashboard" class="tab-panel active">
-        <div class="panel">
-            <h2 class="panel-title">Состояние шлюза</h2>
-            <div class="grid">
-                <div class="card"><div class="card-label">Локальный MQTT</div><div id="localMqtt" class="card-value small">—</div></div>
-                <div class="card"><div class="card-label">Главный MQTT</div><div id="mainMqtt" class="card-value small">—</div></div>
-                <div class="card"><div class="card-label">Wi-Fi</div><div id="wifiRssi" class="card-value">—</div><div class="card-subtitle">dBm</div></div>
-                <div class="card"><div class="card-label">Память ОЗУ</div><div id="freeHeap" class="card-value">—</div></div>
-            </div>
-        </div>
+<section id="tab-dashboard" class="tab active">
+  <div class="panel">
+    <h2>Состояние шлюза</h2>
+    <div class="grid">
+      <div class="card"><div class="label">Wi-Fi</div><div id="wifi" class="value small">—</div></div>
+      <div class="card"><div class="label">Локальный MQTT</div><div id="local" class="value small">—</div></div>
+      <div class="card"><div class="label">Главный MQTT</div><div id="remote" class="value small">—</div></div>
+      <div class="card"><div class="label">Свободная память</div><div id="heap" class="value small">—</div></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Пользовательские виджеты</h2>
+    <div id="widgetGrid" class="grid"></div>
+  </div>
+</section>
 
-        <div class="panel">
-            <h2 class="panel-title">Избранные приборы и датчики</h2>
-            <div id="customWidgetsGrid" class="grid"></div>
-        </div>
-    </section>
+<section id="tab-mqtt" class="tab">
+  <div class="panel">
+    <h2>Последние значения настроенных топиков</h2>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Топик</th><th>Последнее сообщение</th><th>Возраст</th></tr></thead>
+        <tbody id="states"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
 
-    <!-- MQTT -->
-    <section id="tab-mqtt" class="tab-panel">
-        <div class="panel">
-            <h2 class="panel-title">Все сообщения в памяти</h2>
-            <div class="table-wrap">
-                <table>
-                    <thead><tr><th>Топик</th><th>Значение</th><th>Возраст</th></tr></thead>
-                    <tbody id="mqttTable"></tbody>
-                </table>
-            </div>
-        </div>
-    </section>
+<section id="tab-control" class="tab">
+  <div class="panel">
+    <h2>Отправить MQTT-команду</h2>
+    <form id="commandForm">
+      <label>Топик</label>
+      <input id="commandTopic" placeholder="cmnd/device/POWER" required>
+      <label>Payload</label>
+      <textarea id="commandPayload" placeholder="ON"></textarea>
+      <button class="action" type="submit">Отправить</button>
+    </form>
+    <div id="commandResult" class="result"></div>
+  </div>
+</section>
 
-    <!-- Управление -->
-    <section id="tab-control" class="tab-panel">
-        <div class="panel">
-            <h2 class="panel-title">Локальная команда MQTT</h2>
-            <form id="commandForm">
-                <label>Топик (cmnd/...)</label><input id="commandTopic" placeholder="cmnd/zb_bridge/POWER" required>
-                <label>Сообщение</label><textarea id="commandPayload" placeholder="ON"></textarea>
-                <button type="submit" class="action">Отправить</button>
-            </form>
-            <div id="commandResult"></div>
-        </div>
-    </section>
+<section id="tab-widgets" class="tab">
+  <div class="panel">
+    <h2 id="widgetFormTitle">Добавить виджет</h2>
+    <form id="widgetForm">
+      <input type="hidden" id="editIndex" value="-1">
 
-    <!-- Настройки системы -->
-    <section id="tab-settings" class="tab-panel">
-        <div class="panel">
-            <h2 class="panel-title">Параметры сети и MQTT</h2>
-            <form id="settingsForm">
-                <label>Wi-Fi SSID</label><input id="setSsid" required>
-                <label>Wi-Fi Пароль</label><input id="setPass" type="password">
-                <label>MQTT Хост</label><input id="setMqttHost" required>
-                <label>MQTT Порт</label><input id="setMqttPort" type="number" required>
-                <label>MQTT Пользователь</label><input id="setMqttUser">
-                <label>MQTT Пароль</label><input id="setMqttPass" type="password">
-                <button type="submit" class="action">Сохранить и перезагрузить</button>
-            </form>
-            <div id="settingsResult"></div>
-            <hr style="border:0; border-top:1px solid var(--border); margin:20px 0;">
+      <label>Название</label>
+      <input id="wLabel" maxlength="64" required placeholder="Температура в доме">
 
-            <h2 class="panel-title">История датчиков</h2>
+      <label>Тип</label>
+      <select id="wType">
+        <option value="sensor">Датчик</option>
+        <option value="switch">Переключатель</option>
+      </select>
 
-            <form id="historySettingsForm">
-                <label style="display:flex; align-items:center; gap:10px;">
-                    <input
-                        id="historyEnabled"
-                        type="checkbox"
-                        style="width:auto; margin:0;"
-                    >
-                    Записывать историю для графиков
-                </label>
+      <label>Топик состояния</label>
+      <input id="wTopic" maxlength="128" required placeholder="sensor/temperature или tele/device/SENSOR#Temperature">
 
-                <div style="color:var(--muted); font-size:12px; margin:10px 0;">
-                    При отключении накопленная история удаляется из памяти.
-                </div>
+      <div id="sensorFields">
+        <label>Единица измерения</label>
+        <input id="wUnit" maxlength="24" placeholder="°C, V, W, %">
+      </div>
 
-                <button
-                    type="submit"
-                    class="action"
-                    id="saveHistoryButton"
-                    disabled
-                >
-                    Сохранить
-                </button>
-            </form>
+      <div id="switchFields" style="display:none">
+        <label>Топик команды</label>
+        <input id="wCmdTopic" maxlength="128" placeholder="cmnd/device/POWER">
+        <label>Payload включения</label>
+        <input id="wPayloadOn" maxlength="512" placeholder="ON">
+        <label>Payload выключения</label>
+        <input id="wPayloadOff" maxlength="512" placeholder="OFF">
+      </div>
 
-            <div id="historySettingsResult"></div>
+      <button class="action" id="widgetSubmit" type="submit">Добавить</button>
+      <button class="action danger" id="cancelEdit" type="button" style="display:none">Отмена</button>
+    </form>
+    <div id="widgetResult" class="result"></div>
+  </div>
 
-        </div>
-    </section>
+  <div class="panel">
+    <h2>Сохранённые виджеты</h2>
+    <div id="widgetList"></div>
+  </div>
+</section>
 
-    <!-- Настройка виджетов дашборда -->
-    <!-- Настройка виджетов дашборда -->
-    <section id="tab-dashconfig" class="tab-panel">
-        <div class="panel">
-            <h2 class="panel-title" id="formTitle">Добавить элемент на дашборд</h2>
-            <form id="addWidgetForm">
-                <input type="hidden" id="editIndex" value="-1">
-                
-                <label>Название</label>
-                <input id="wLabel" required placeholder="Например: Температура в доме">
-                
-                <label>Тип элемента</label>
-                <select id="wType" onchange="toggleSwitchFields()">
-                    <option value="sensor">Датчик (чтение значения)</option>
-                    <option value="switch">Кнопка / Выключатель (управление)</option>
-                </select>
-                
-                <label>Топик состояния (State Topic)</label>
-                <input id="wTopic" placeholder="must_pv18/pv_voltage или tele/...#Temperature" required>
-                
-                <!-- Поле единицы измерения -->
-                <div id="sensorFields">
-                    <label>Единица измерения (суффикс)</label>
-                    <input id="wUnit" placeholder="V, A, W, °C, %">
-                </div>
-
-                <div id="switchFields" style="display:none;">
-                    <label>Топик команды (Command Topic)</label>
-                    <input id="wCmdTopic" placeholder="cmnd/tasmota_zb/zbsend">
-                    
-                    <label>JSON для ВКЛ (ON)</label>
-                    <input id="wPayloadOn" placeholder='{"Device":"Patio","send":{"power": "on"}}'>
-                    
-                    <label>JSON для ВЫКЛ (OFF)</label>
-                    <input id="wPayloadOff" placeholder='{"Device":"Patio","send":{"power": "off"}}'>
-                </div>
-
-                <!-- Блок настройки оповещений MAX -->
-                <!-- Блок оповещений в MAX -->
-                <div style="margin-top: 15px; border-top: 1px solid var(--border); padding-top: 12px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                        <label style="color: var(--accent); font-weight: bold; margin:0;">📢 Оповещения в MAX</label>
-                        <button type="button" class="action" style="padding: 4px 10px; font-size: 11px;" onclick="addAlertRule()">+ Добавить правило</button>
-                    </div>
-                    <div id="alertRulesContainer"></div>
-                </div>
-
-                <div style="display: flex; gap: 8px; margin-top: 14px;">
-                    <button type="submit" class="action" id="submitBtn">Добавить</button>
-                    <button type="button" class="action danger" id="cancelBtn" style="display:none;" onclick="cancelEdit()">Отмена</button>
-                </div>
-            </form>
-        </div>
-        <div class="panel">
-            <h2 class="panel-title">Активные элементы на дашборде</h2>
-            <div id="widgetsList"></div>
-        </div>
-    </section>
-    <!-- Настройки MAX -->
-    <section id="tab-max" class="tab-panel">
-        <div class="panel">
-            <h2 class="panel-title">Параметры интеграции MAX</h2>
-            <form id="maxForm">
-                <label>Токен авторизации (Authorization)</label>
-                <input id="maxToken" type="password" placeholder="Ваш токен бота MAX" required>
-                
-                <label>ID пользователя (User ID)</label>
-                <input id="maxUserId" placeholder="Например: 123456789" required>
-
-                <div style="display: flex; gap: 8px;">
-                    <button type="submit" class="action">Сохранить</button>
-                    <button type="button" class="action" style="background:#205081; border-color:#2a66a1;" onclick="sendMaxTest()">Тест (Отправить сообщение)</button>
-                </div>
-            </form>
-            <div id="maxResult"></div>
-        </div>
-    </section>
+<section id="tab-settings" class="tab">
+  <div class="panel">
+    <h2>Wi-Fi и главный MQTT-брокер</h2>
+    <form id="settingsForm">
+      <label>Wi-Fi SSID</label><input id="ssid" required>
+      <label>Пароль Wi-Fi</label><input id="wifiPass" type="password">
+      <label>Хост MQTT</label><input id="mqttHost" required>
+      <label>Порт MQTT</label><input id="mqttPort" type="number" min="1" max="65535" required>
+      <label>Пользователь MQTT</label><input id="mqttUser">
+      <label>Пароль MQTT</label><input id="mqttPass" type="password">
+      <button class="action" type="submit">Сохранить и перезагрузить</button>
+    </form>
+    <div id="settingsResult" class="result"></div>
+  </div>
+</section>
 </main>
 
-<!-- Модальное окно графика -->
-<div id="chartModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; justify-content:center; align-items:center;">
-    <div style="background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; width:90%; max-width:600px; position:relative;">
-        <h3 id="chartTitle" style="margin-top:0; color:var(--text); font-size:16px;">График до 6 часов</h3>
-        <div id="chartContainer" style="width:100%; height:250px; display:flex; align-items:center; justify-content:center;">
-            <svg id="sensorChart" width="100%" height="100%" viewBox="0 0 500 200" style="overflow:visible;"></svg>
-        </div>
-        <button class="action" style="margin-top:15px; width:100%;" onclick="closeChart()">Закрыть</button>
-    </div>
-</div>
-
 <script>
-let globalStates = {};
-let activeWidgets = [];
+let widgets = [];
+let statesByTopic = {};
 
-let currentAlertRules = [];
-
-function renderAlertRules(rules) {
-    const container = document.getElementById("alertRulesContainer");
-    container.replaceChildren();
-    
-    if (!rules || rules.length === 0) {
-        container.innerHTML = '<div class="empty-notice" style="color:var(--muted); font-size:12px; margin-bottom:10px;">Нет активных правил оповещений.</div>';
-        return;
-    }
-
-    rules.forEach((r, idx) => {
-        const isBetween = r.cond === 'between';
-        const div = document.createElement("div");
-        div.className = "alert-rule-card";
-        div.style.cssText = "background:var(--card); border:1px solid var(--border); padding:10px; border-radius:6px; margin-bottom:8px; position:relative;";
-        div.innerHTML = `
-            <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
-                <span style="font-size:11px; color:var(--muted);">Правило #${idx + 1}</span>
-                <button type="button" class="action danger" style="padding:2px 6px; font-size:10px;" onclick="removeAlertRule(${idx})">Удалить</button>
-            </div>
-            <label>Условие</label>
-            <select class="rCond" onchange="onConditionChange(this)" style="width:100%; padding:6px; margin:4px 0 8px; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
-                <option value="change" ${r.cond==='change'?'selected':''}>При любом изменении</option>
-                <option value="below" ${r.cond==='below'?'selected':''}>Ниже порога (&lt;)</option>
-                <option value="above" ${r.cond==='above'?'selected':''}>Выше порога (&gt;)</option>
-                <option value="between" ${r.cond==='between'?'selected':''}>Между (От и До)</option>
-            </select>
-
-            <div class="singleValBlock" style="display: ${isBetween ? 'none' : 'block'};">
-                <label>Порог</label>
-                <input class="rVal" type="number" step="any" value="${!isBetween && r.val !== undefined ? r.val : ''}" placeholder="Значение порога" style="width:100%; padding:6px; margin:4px 0 8px; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
-            </div>
-
-            <div class="rangeValBlock" style="display: ${isBetween ? 'flex' : 'none'}; gap: 8px; margin-bottom: 8px;">
-                <div style="flex:1;">
-                    <label>От (мин)</label>
-                    <input class="rValMin" type="number" step="any" value="${isBetween && r.val !== undefined ? r.val : ''}" placeholder="Мин" style="width:100%; padding:6px; margin:4px 0 0; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
-                </div>
-                <div style="flex:1;">
-                    <label>До (макс)</label>
-                    <input class="rValMax" type="number" step="any" value="${isBetween && r.valMax !== undefined ? r.valMax : ''}" placeholder="Макс" style="width:100%; padding:6px; margin:4px 0 0; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
-                </div>
-            </div>
-
-            <label>Текст сообщения</label>
-            <input class="rMsg" type="text" value="${r.msg || ''}" placeholder="Текст уведомления" style="width:100%; padding:6px; margin:4px 0 4px; background:var(--background); color:var(--text); border:1px solid #353945; border-radius:4px;">
-        `;
-        container.appendChild(div);
-    });
+function api(url, options) {
+  return fetch(url, options || {cache:"no-store"});
 }
-    
-window.addAlertRule = function(cond = 'below', val = '', valMax = '', msg = '') {
-    currentAlertRules.push({ cond, val, valMax, msg });
-    renderAlertRules(currentAlertRules);
+function setText(id, value) {
+  document.getElementById(id).textContent = value;
 }
-
-window.removeAlertRule = function(index) {
-    currentAlertRules.splice(index, 1);
-    renderAlertRules(currentAlertRules);
-}
-
-function toggleSwitchFields() {
-    const type = document.getElementById("wType").value;
-    document.getElementById("switchFields").style.display = (type === "switch") ? "block" : "none";
-    document.getElementById("sensorFields").style.display = (type === "sensor") ? "block" : "none";
-}
-
 function activateTab(name) {
-    document.querySelectorAll(".tab-button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
-    document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
+  document.querySelectorAll("nav button").forEach(b =>
+    b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".tab").forEach(s =>
+    s.classList.toggle("active", s.id === "tab-" + name));
 }
-document.querySelectorAll(".tab-button").forEach(b => b.addEventListener("click", () => activateTab(b.dataset.tab)));
+document.querySelectorAll("nav button").forEach(b =>
+  b.addEventListener("click", () => activateTab(b.dataset.tab)));
 
-function setConnection(id, connected) {
-    const el = document.getElementById(id);
-    el.textContent = connected ? "Подключён" : "Нет связи";
-    el.className = "card-value small " + (connected ? "ok" : "error");
-}
+function getWidgetValue(widget) {
+  const parts = String(widget.topic || "").split("#");
+  const base = parts[0].trim();
+  let value = statesByTopic[base];
 
-async function sendCommand(topic, payload) {
+  if (value === undefined) return {found:false, value:"—"};
+
+  if (parts.length > 1) {
     try {
-        await fetch("/api/command", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ topic: topic, payload: payload })
-        });
-    } catch(e) { 
-        alert("Ошибка отправки команды"); 
+      const obj = JSON.parse(value);
+      const wanted = parts.slice(1).join("#").trim().toLowerCase();
+      value = findJsonKey(obj, wanted);
+      if (value === undefined || value === null || typeof value === "object")
+        return {found:false, value:"—"};
+    } catch (_) {
+      return {found:false, value:"—"};
     }
+  }
+  return {found:true, value:String(value)};
 }
-
-function findJsonValue(obj, targetKey) {
-    if (!obj || typeof obj !== 'object') return undefined;
-    
-    targetKey = targetKey.toLowerCase();
-    
-    for (const key of Object.keys(obj)) {
-        if (key.toLowerCase() === targetKey) {
-            return obj[key];
-        }
-        if (typeof obj[key] === 'object' && obj[key] !== null) {
-            const res = findJsonValue(obj[key], targetKey);
-            if (res !== undefined) return res;
-        }
-    }
-    return undefined;
+function findJsonKey(obj, wanted) {
+  if (!obj || typeof obj !== "object") return undefined;
+  for (const key of Object.keys(obj)) {
+    if (key.toLowerCase() === wanted) return obj[key];
+    const nested = findJsonKey(obj[key], wanted);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
 }
-
-function formatSensorValue(v) {
-    if (v === null || v === undefined || v === "—") return "—";
-    const num = Number(v);
-    // Проверяем, что это число, а не boolean или пустая строка
-    if (!isNaN(num) && typeof v !== 'boolean' && String(v).trim() !== "") {
-        return num.toFixed(1);
-    }
-    return v;
+function addText(parent, className, text) {
+  const el = document.createElement("div");
+  el.className = className;
+  el.textContent = text;
+  parent.appendChild(el);
+  return el;
 }
-
-function renderDashboardWidgets() {
-    const container = document.getElementById("customWidgetsGrid");
-    container.replaceChildren();
-
-    if (activeWidgets.length === 0) {
-        container.innerHTML = '<div style="color:var(--muted); grid-column: span 4;">Дашборд пуст. Перейдите в "⚙️ Настройка дашборда", чтобы добавить датчики или выключатели.</div>';
-        return;
-    }
-
-    activeWidgets.forEach((w, index) => {
-        const card = document.createElement("div");
-        card.className = "card";
-        
-        let val = "—";
-        let hasValue = false;
-
-        if (w.topic) {
-            if (w.topic.includes('#')) {
-                const parts = w.topic.split('#');
-                const baseTopic = parts[0].trim();
-                const jsonKey = parts[1].trim();
-                
-                const rawPayload = globalStates[baseTopic];
-                if (rawPayload !== undefined) {
-                    try {
-                        const parsed = JSON.parse(rawPayload);
-                        const found = findJsonValue(parsed, jsonKey);
-                        if (found !== undefined && typeof found !== 'object') {
-                            val = found;
-                            hasValue = true;
-                        }
-                    } catch (e) {}
-                }
-            } else {
-                const cleanTopic = w.topic.trim();
-                if (globalStates[cleanTopic] !== undefined) {
-                    val = globalStates[cleanTopic];
-                    hasValue = true;
-                }
-            }
-        }
-
-        if (w.type === "sensor") {
-            const formattedVal = formatSensorValue(val);
-            const num = Number(val);
-            const isNegative = !isNaN(num) && num < 0;
-            const unitStr = w.unit ? ` <span style="font-size: 14px; color: var(--muted);">${w.unit}</span>` : "";
-            card.innerHTML = `<div class="card-label">${w.label}</div><div class="card-value ${isNegative ? 'negative' : ''}">${formattedVal}${unitStr}</div>`;
-            card.style.cursor = "pointer";
-            card.title = "Кликните для просмотра графика";
-            card.onclick = () => openChart(w.topic, w.label, w.unit);
-        } else if (w.type === "switch") {
-            const valStr = String(val).toLowerCase().trim();
-            const isOn = hasValue && (valStr === "on" || valStr === "1" || valStr === "true" || valStr === "yes");
-            const displayVal = hasValue ? (isOn ? "ВКЛ" : "ВЫКЛ") : "—";
-            
-            card.innerHTML = `<div class="card-label">${w.label}</div><div class="card-value small">${displayVal}</div><button class="btn-switch ${isOn ? 'on' : ''}">${isOn ? 'ВЫКЛ' : 'ВКЛ'}</button>`;
-            
-            const btn = card.querySelector("button");
-            btn.onclick = () => {
-                const nextPayload = !isOn 
-                    ? (w.payloadOn || "ON") 
-                    : (w.payloadOff || "OFF");
-                
-                sendCommand(w.cmdTopic || w.topic, nextPayload);
-            };
-        }
-        container.appendChild(card);
-    });
+function sendCommand(topic, payload, resultElement) {
+  return api("/api/command", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({topic:topic, payload:payload})
+  }).then(async r => {
+    const text = await r.text();
+    if (resultElement) resultElement.textContent = text;
+    if (!r.ok) throw new Error(text);
+  });
 }
+function renderWidgets() {
+  const grid = document.getElementById("widgetGrid");
+  grid.replaceChildren();
 
-async function openChart(topic, label, unit) {
-    document.getElementById("chartTitle").textContent = label + " (до 6 часов)";
-    document.getElementById("chartModal").style.display = "flex";
-    
-    const svg = document.getElementById("sensorChart");
-    svg.innerHTML = '<text x="250" y="100" fill="#848996" text-anchor="middle">Загрузка данных...</text>';
+  if (!widgets.length) {
+    addText(grid, "muted", "Виджетов пока нет. Добавьте датчик или переключатель во вкладке «Виджеты».");
+    return;
+  }
 
-    try {
-        const res = await fetch(`/api/history?topic=${encodeURIComponent(topic)}`);
+  widgets.forEach(w => {
+    const card = document.createElement("div");
+    card.className = "card";
+    addText(card, "label", w.label || w.topic);
 
-        if (res.status === 503) {
-            svg.innerHTML = '<text x="250" y="100" fill="#848996" text-anchor="middle">Запись истории отключена</text>';
-            return;
-        }
+    const state = getWidgetValue(w);
 
-        if (!res.ok) {
-            throw new Error("HTTP " + res.status);
-        }
+    if (w.type === "switch") {
+      const text = state.found ? state.value.trim().toLowerCase() : "";
+      const isOn = ["on","1","true","yes"].includes(text);
+      addText(card, "value small", state.found ? (isOn ? "ВКЛ" : "ВЫКЛ") : "—");
 
-        const data = await res.json();
-
-        if (!Array.isArray(data) || data.length === 0) {
-            svg.innerHTML = '<text x="250" y="100" fill="#848996" text-anchor="middle">Нет данных истории</text>';
-            return;
-        }
-
-        const values = data.map(d => d.val);
-        const min = Math.min(...values);
-        const max = Math.max(...values);
-        const range = (max - min) || 1;
-
-        let points = "";
-        const width = 500;
-        const height = 180;
-
-        data.forEach((d, i) => {
-            const x = (i / (data.length - 1 || 1)) * width;
-            const y = height - ((d.val - min) / range) * (height - 20) - 10;
-            points += `${x},${y} `;
-        });
-
-        svg.innerHTML = `
-            <rect width="500" height="200" fill="#111319" rx="5"/>
-            <line x1="0" y1="40" x2="500" y2="40" stroke="#242731" stroke-dasharray="4"/>
-            <line x1="0" y1="110" x2="500" y2="110" stroke="#242731" stroke-dasharray="4"/>
-            <line x1="0" y1="180" x2="500" y2="180" stroke="#242731" stroke-dasharray="4"/>
-            <text x="10" y="35" fill="#848996" font-size="10">${max.toFixed(1)} ${unit || ''}</text>
-            <text x="10" y="175" fill="#848996" font-size="10">${min.toFixed(1)} ${unit || ''}</text>
-            <polyline fill="none" stroke="#78d594" stroke-width="3" points="${points}"/>
-        `;
-    } catch(e) {
-        svg.innerHTML = '<text x="250" y="100" fill="#f27d83" text-anchor="middle">Ошибка загрузки графика</text>';
-    }
-}
-
-function closeChart() {
-    document.getElementById("chartModal").style.display = "none";
-}
-
-function renderWidgetsConfigList() {
-    const list = document.getElementById("widgetsList");
-    list.replaceChildren();
-    
-    if (activeWidgets.length === 0) {
-        list.innerHTML = '<div style="color:var(--muted);">Нет добавленных элементов.</div>';
-        return;
-    }
-    
-    activeWidgets.forEach((w, index) => {
-        const row = document.createElement("div");
-        row.className = "widget-row";
-        row.innerHTML = `
-            <span><b>${w.label}</b> [${w.type}] → <code>${w.topic}</code></span>
-            <button class="action" style="background:#205081; border-color:#2a66a1; padding:6px 12px;" onclick="editWidget(${index})">Изменить</button>
-            <button class="action danger" style="padding:6px 12px;" onclick="removeWidget(${index})">Удалить</button>
-        `;
-        list.appendChild(row);
-    });
-}
-
-async function loadWidgets() {
-    try {
-        const res = await fetch("/api/widgets", { cache: "no-store" });
-        if (res.ok) {
-            const data = await res.json();
-            if (Array.isArray(data)) {
-                activeWidgets = data;
-                renderWidgetsConfigList();
-                renderDashboardWidgets();
-            }
-        }
-    } catch(e) {
-        console.error("Ошибка загрузки виджетов:", e);
-    }
-}
-
-async function saveWidgets() {
-    const response = await fetch("/api/widgets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(activeWidgets)
-    });
-    if (!response.ok) {
-        throw new Error(await response.text());
-    }
-    renderWidgetsConfigList();
-    renderDashboardWidgets();
-}
-
-async function loadMaxSettings() {
-    try {
-        const res = await fetch("/api/max-settings");
-        const data = await res.json();
-        document.getElementById("maxToken").value = data.token || "";
-        document.getElementById("maxUserId").value = data.userid || "";
-    } catch(e) {}
-}
-
-document.getElementById("maxForm").addEventListener("submit", async function(e) {
-    e.preventDefault();
-    const res = document.getElementById("maxResult");
-    const body = new URLSearchParams({
-        token: document.getElementById("maxToken").value.trim(),
-        userid: document.getElementById("maxUserId").value.trim()
-    });
-    try {
-        const response = await fetch("/api/max-settings", { method: "POST", body });
-        res.textContent = await response.text();
-        res.className = "ok";
-    } catch(err) { res.textContent = "Ошибка: " + err; res.className = "error"; }
-});
-
-async function sendMaxTest() {
-    const res = document.getElementById("maxResult");
-    res.textContent = "Отправка тестового сообщения...";
-    res.className = "";
-    try {
-        const response = await fetch("/api/max-test", { method: "POST" });
-        res.textContent = await response.text();
-        res.className = response.ok ? "ok" : "error";
-    } catch(err) {
-        res.textContent = "Ошибка теста: " + err;
-        res.className = "error";
-    }
-}
-
-window.editWidget = function(index) {
-    const w = activeWidgets[index];
-    document.getElementById("editIndex").value = index;
-    document.getElementById("wLabel").value = w.label;
-    document.getElementById("wType").value = w.type;
-    document.getElementById("wTopic").value = w.topic;
-    document.getElementById("wCmdTopic").value = w.cmdTopic || "";
-    document.getElementById("wPayloadOn").value = w.payloadOn || "";
-    document.getElementById("wPayloadOff").value = w.payloadOff || "";
-    document.getElementById("wUnit").value = w.unit || "";
-    currentAlertRules = w.alerts || [];
-    renderAlertRules(currentAlertRules);
-    
-    toggleSwitchFields();
-    
-    document.getElementById("formTitle").textContent = "Редактировать элемент";
-    document.getElementById("submitBtn").textContent = "Сохранить";
-    document.getElementById("cancelBtn").style.display = "inline-block";
-    
-    // Перекручиваем страницу наверх к форме
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-}
-
-window.onConditionChange = function(select) {
-    const card = select.closest('.alert-rule-card');
-    const isBetween = select.value === 'between';
-    
-    const singleBlock = card.querySelector('.singleValBlock');
-    const rangeBlock = card.querySelector('.rangeValBlock');
-    
-    if (singleBlock) singleBlock.style.display = isBetween ? 'none' : 'block';
-    if (rangeBlock) rangeBlock.style.display = isBetween ? 'flex' : 'none';
-}
-    
-window.cancelEdit = function() {
-    document.getElementById("addWidgetForm").reset();
-    document.getElementById("editIndex").value = "-1";
-    document.getElementById("formTitle").textContent = "Добавить элемент на дашборд";
-    document.getElementById("submitBtn").textContent = "Добавить";
-    document.getElementById("cancelBtn").style.display = "none";
-    currentAlertRules = [];
-    renderAlertRules(currentAlertRules);
-    toggleSwitchFields();
-}
-
-window.removeWidget = async function(index) {
-    if (confirm("Удалить этот элемент?")) {
-        activeWidgets.splice(index, 1);
-        await saveWidgets();
-        cancelEdit();
-    }
-}
-
-document.getElementById("addWidgetForm").addEventListener("submit", async function(e) {
-    e.preventDefault();
-    const editIndex = parseInt(document.getElementById("editIndex").value);
-    const type = document.getElementById("wType").value;
-
-    // Сбор правил оповещений (выбираем только карточки правил, игнорируя текст-заглушку)
-    const alertRules = [];
-    document.querySelectorAll("#alertRulesContainer .alert-rule-card").forEach(div => {
-        const cond = div.querySelector(".rCond").value;
-        let val = 0, valMax = 0;
-        
-        if (cond === 'between') {
-            val = parseFloat(div.querySelector(".rValMin").value) || 0;
-            valMax = parseFloat(div.querySelector(".rValMax").value) || 0;
-        } else {
-            val = parseFloat(div.querySelector(".rVal").value) || 0;
-        }
-
-        alertRules.push({
-            cond: cond,
-            val: val,
-            valMax: valMax,
-            msg: div.querySelector(".rMsg").value.trim()
-        });
-    });
-
-    const w = {
-        label: document.getElementById("wLabel").value,
-        type: type,
-        topic: document.getElementById("wTopic").value.trim(),
-        unit: type === "sensor" ? document.getElementById("wUnit").value.trim() : "",
-        cmdTopic: type === "switch" ? document.getElementById("wCmdTopic").value.trim() : "",
-        payloadOn: type === "switch" ? document.getElementById("wPayloadOn").value.trim() : "",
-        payloadOff: type === "switch" ? document.getElementById("wPayloadOff").value.trim() : "",
-        alerts: alertRules
-    };
-
-    if (editIndex >= 0) {
-        activeWidgets[editIndex] = w; // Обновляем существующий
+      const button = document.createElement("button");
+      button.className = "switch" + (isOn ? " on" : "");
+      button.textContent = isOn ? "Выключить" : "Включить";
+      button.onclick = () => sendCommand(
+        w.cmdTopic || w.topic,
+        isOn ? (w.payloadOff || "OFF") : (w.payloadOn || "ON"),
+        document.getElementById("commandResult")
+      ).catch(e => alert("Команда не отправлена: " + e.message));
+      card.appendChild(button);
     } else {
-        activeWidgets.push(w); // Добавляем новый
+      let value = state.value;
+      if (state.found && value !== "" && !isNaN(Number(value)))
+        value = Number(value).toFixed(1);
+      addText(card, "value", state.found ? value : "—");
+      if (w.unit) addText(card, "muted", w.unit);
     }
 
+    grid.appendChild(card);
+  });
+}
+function renderWidgetList() {
+  const list = document.getElementById("widgetList");
+  list.replaceChildren();
+
+  if (!widgets.length) {
+    addText(list, "muted", "Виджетов пока нет.");
+    return;
+  }
+
+  widgets.forEach((w, i) => {
+    const row = document.createElement("div");
+    row.className = "widget-row";
+    const title = document.createElement("span");
+    title.textContent = `${w.label} [${w.type}] — ${w.topic}`;
+    row.appendChild(title);
+
+    const edit = document.createElement("button");
+    edit.className = "action";
+    edit.textContent = "Изменить";
+    edit.onclick = () => editWidget(i);
+    row.appendChild(edit);
+
+    const remove = document.createElement("button");
+    remove.className = "action danger";
+    remove.textContent = "Удалить";
+    remove.onclick = () => removeWidget(i);
+    row.appendChild(remove);
+
+    list.appendChild(row);
+  });
+}
+function renderStates(states) {
+  statesByTopic = {};
+  const body = document.getElementById("states");
+  body.replaceChildren();
+
+  states.forEach(s => {
+    statesByTopic[s.topic] = s.payload;
+    const row = document.createElement("tr");
+    [s.topic, s.payload, s.age_seconds + " с"].forEach(value => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
+    });
+    body.appendChild(row);
+  });
+
+  renderWidgets();
+}
+async function loadWidgets() {
+  const r = await api("/api/widgets");
+  if (!r.ok) throw new Error(await r.text());
+  widgets = await r.json();
+  renderWidgetList();
+}
+async function updateDashboard() {
+  try {
+    const r = await api("/api/status");
+    if (!r.ok) return;
+    const d = await r.json();
+    setText("wifi", d.wifi ? `${d.ip} (${d.rssi} dBm)` : "Нет связи");
+    setText("local", d.local_mqtt ? "Подключён" : "Нет связи");
+    setText("remote", d.main_mqtt ? "Подключён" : "Нет связи");
+    setText("heap", Math.round(d.free_heap / 1024) + " КБ");
+    setText("version", d.version || "");
+    renderStates(d.states || []);
+  } catch (_) {}
+}
+function toggleWidgetFields() {
+  const isSwitch = document.getElementById("wType").value === "switch";
+  document.getElementById("switchFields").style.display = isSwitch ? "block" : "none";
+  document.getElementById("sensorFields").style.display = isSwitch ? "none" : "block";
+}
+document.getElementById("wType").addEventListener("change", toggleWidgetFields);
+
+function resetWidgetForm() {
+  document.getElementById("widgetForm").reset();
+  document.getElementById("editIndex").value = "-1";
+  document.getElementById("widgetFormTitle").textContent = "Добавить виджет";
+  document.getElementById("widgetSubmit").textContent = "Добавить";
+  document.getElementById("cancelEdit").style.display = "none";
+  toggleWidgetFields();
+}
+function editWidget(index) {
+  const w = widgets[index];
+  document.getElementById("editIndex").value = index;
+  document.getElementById("wLabel").value = w.label || "";
+  document.getElementById("wType").value = w.type || "sensor";
+  document.getElementById("wTopic").value = w.topic || "";
+  document.getElementById("wUnit").value = w.unit || "";
+  document.getElementById("wCmdTopic").value = w.cmdTopic || "";
+  document.getElementById("wPayloadOn").value = w.payloadOn || "";
+  document.getElementById("wPayloadOff").value = w.payloadOff || "";
+  document.getElementById("widgetFormTitle").textContent = "Изменить виджет";
+  document.getElementById("widgetSubmit").textContent = "Сохранить";
+  document.getElementById("cancelEdit").style.display = "inline-block";
+  toggleWidgetFields();
+  activateTab("widgets");
+}
+async function saveWidgets() {
+  const r = await api("/api/widgets", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(widgets)
+  });
+  if (!r.ok) throw new Error(await r.text());
+  renderWidgetList();
+  renderWidgets();
+}
+async function removeWidget(index) {
+  if (!confirm("Удалить виджет?")) return;
+  widgets.splice(index, 1);
+  try {
     await saveWidgets();
-    cancelEdit();
-    alert("Сохранено!");
+  } catch(e) {
+    alert("Не удалось сохранить: " + e.message);
+    await loadWidgets();
+  }
+}
+document.getElementById("cancelEdit").onclick = resetWidgetForm;
+document.getElementById("widgetForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const type = document.getElementById("wType").value;
+  const w = {
+    label:document.getElementById("wLabel").value.trim(),
+    type:type,
+    topic:document.getElementById("wTopic").value.trim(),
+    unit:type === "sensor" ? document.getElementById("wUnit").value.trim() : "",
+    cmdTopic:type === "switch" ? document.getElementById("wCmdTopic").value.trim() : "",
+    payloadOn:type === "switch" ? document.getElementById("wPayloadOn").value : "",
+    payloadOff:type === "switch" ? document.getElementById("wPayloadOff").value : ""
+  };
+  const index = Number(document.getElementById("editIndex").value);
+  if (index >= 0) widgets[index] = w;
+  else widgets.push(w);
+
+  try {
+    await saveWidgets();
+    resetWidgetForm();
+    setText("widgetResult", "Виджет сохранён.");
+  } catch(err) {
+    setText("widgetResult", "Ошибка: " + err.message);
+    await loadWidgets();
+  }
 });
 
-async function updateDashboard() {
-    try {
-        const res = await fetch("/api/status", { cache: "no-store" });
-        if (!res.ok) return;
-        const data = await res.json();
-        
-        document.getElementById("wifiRssi").textContent = data.rssi + " dBm";
-        document.getElementById("freeHeap").textContent = Math.round(data.free_heap / 1024) + " КБ";
-        document.getElementById("fwVersion").textContent = data.version || "—";
-        setConnection("localMqtt", data.local_mqtt);
-        setConnection("mainMqtt", data.main_mqtt);
-
-        globalStates = {};
-        const tbody = document.getElementById("mqttTable");
-        tbody.replaceChildren();
-        
-        for (const st of data.states) {
-            globalStates[st.topic] = st.payload;
-            const row = document.createElement("tr");
-            row.innerHTML = `<td>${st.topic}</td><td>${st.payload}</td><td>${st.age_seconds}с</td>`;
-            tbody.appendChild(row);
-        }
-
-        renderDashboardWidgets();
-    } catch (e) {
-        console.error("Ошибка обновления статуса:", e);
-    }
-}
+document.getElementById("commandForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    await sendCommand(
+      document.getElementById("commandTopic").value.trim(),
+      document.getElementById("commandPayload").value,
+      document.getElementById("commandResult")
+    );
+  } catch(err) {
+    setText("commandResult", "Ошибка: " + err.message);
+  }
+});
 
 async function loadSettings() {
-    try {
-        const res = await fetch("/api/settings");
-        if (!res.ok) return;
-        const data = await res.json();
-
-        // Поля страницы настроек дашборда
-        const setSsid = document.getElementById("setSsid");
-        if (setSsid) setSsid.value = data.ssid || "";
-
-        const setPass = document.getElementById("setPass");
-        if (setPass) setPass.value = data.pass || "";
-
-        const setMqttHost = document.getElementById("setMqttHost");
-        if (setMqttHost) setMqttHost.value = data.host || "";
-
-        const setMqttPort = document.getElementById("setMqttPort");
-        if (setMqttPort) setMqttPort.value = data.port || 1883;
-
-        const setMqttUser = document.getElementById("setMqttUser");
-        if (setMqttUser) setMqttUser.value = data.user || "";
-
-        const setMqttPass = document.getElementById("setMqttPass");
-        if (setMqttPass) setMqttPass.value = data.pass_mqtt || "";
-
-        // Поля страницы первоначальной настройки (AP)
-        const ssidInput = document.getElementById("ssidInput");
-        if (ssidInput) ssidInput.value = data.ssid || "";
-
-        const passInput = document.getElementById("passInput");
-        if (passInput) passInput.value = data.pass || "";
-
-        const mqttHostInput = document.getElementById("mqttHostInput");
-        if (mqttHostInput) mqttHostInput.value = data.host || "";
-
-        const mqttPortInput = document.getElementById("mqttPortInput");
-        if (mqttPortInput) mqttPortInput.value = data.port || 1883;
-
-        const mqttUserInput = document.getElementById("mqttUserInput");
-        if (mqttUserInput) mqttUserInput.value = data.user || "";
-
-        const mqttPassInput = document.getElementById("mqttPassInput");
-        if (mqttPassInput) mqttPassInput.value = data.pass_mqtt || "";
-
-        // Выключатель истории
-        const historyCheckbox = document.getElementById("historyEnabled");
-        if (historyCheckbox) {
-            historyCheckbox.checked = data.history_enabled === true;
-            historyCheckbox.dataset.saved = historyCheckbox.checked ? "1" : "0";
-        }
-
-        const saveHistoryButton = document.getElementById("saveHistoryButton");
-        if (saveHistoryButton) {
-            saveHistoryButton.disabled = false;
-        }
-    } catch (e) {
-        console.error("Ошибка загрузки настроек:", e);
-    }
+  const r = await api("/api/settings");
+  if (!r.ok) return;
+  const s = await r.json();
+  document.getElementById("ssid").value = s.ssid || "";
+  document.getElementById("wifiPass").value = s.pass || "";
+  document.getElementById("mqttHost").value = s.host || "";
+  document.getElementById("mqttPort").value = s.port || 1883;
+  document.getElementById("mqttUser").value = s.user || "";
+  document.getElementById("mqttPass").value = s.pass_mqtt || "";
 }
-
-document.getElementById("settingsForm").addEventListener("submit", async function(e) {
-    e.preventDefault();
-    const res = document.getElementById("settingsResult");
-    const body = new URLSearchParams({
-        ssid: document.getElementById("setSsid").value, pass: document.getElementById("setPass").value,
-        host: document.getElementById("setMqttHost").value, port: document.getElementById("setMqttPort").value,
-        user: document.getElementById("setMqttUser").value, pass_mqtt: document.getElementById("setMqttPass").value
-    });
-    try {
-        const response = await fetch("/api/settings", { method: "POST", body });
-        res.textContent = await response.text();
-        res.className = "ok";
-    } catch(err) { res.textContent = "Ошибка: " + err; res.className = "error"; }
+document.getElementById("settingsForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const body = new URLSearchParams({
+    ssid:document.getElementById("ssid").value,
+    pass:document.getElementById("wifiPass").value,
+    host:document.getElementById("mqttHost").value,
+    port:document.getElementById("mqttPort").value,
+    user:document.getElementById("mqttUser").value,
+    pass_mqtt:document.getElementById("mqttPass").value
+  });
+  try {
+    const r = await api("/api/settings", {method:"POST", body:body});
+    setText("settingsResult", await r.text());
+  } catch(err) {
+    setText("settingsResult", "Ошибка: " + err);
+  }
 });
 
-document.getElementById("historySettingsForm").addEventListener(
-    "submit",
-    async function(e) {
-        e.preventDefault();
-
-        const checkbox = document.getElementById("historyEnabled");
-        const button = document.getElementById("saveHistoryButton");
-        const result = document.getElementById("historySettingsResult");
-
-        const enabled = checkbox.checked;
-        button.disabled = true;
-        result.textContent = "Сохранение...";
-
-        try {
-            const response = await fetch("/api/history-setting", {
-                method: "POST",
-                body: new URLSearchParams({
-                    enabled: enabled ? "1" : "0"
-                })
-            });
-
-            const message = await response.text();
-
-            if (!response.ok) {
-                throw new Error(message || ("HTTP " + response.status));
-            }
-
-            checkbox.dataset.saved = enabled ? "1" : "0";
-            result.textContent = message;
-            result.className = "ok";
-        } catch (error) {
-            // При ошибке возвращаем последнее загруженное или сохранённое значение.
-            checkbox.checked = checkbox.dataset.saved === "1";
-            result.textContent = "Ошибка: " + error.message;
-            result.className = "error";
-        } finally {
-            button.disabled = false;
-        }
-    }
-);
-
-document.getElementById("commandForm").addEventListener(
-    "submit",
-    async function(e) {
-        e.preventDefault();
-
-        const result = document.getElementById("commandResult");
-
-        const command = {
-            topic: document.getElementById("commandTopic").value.trim(),
-            payload: document.getElementById("commandPayload").value
-        };
-
-        try {
-            const response = await fetch("/api/command", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(command)
-            });
-
-            result.textContent = await response.text();
-            result.className = response.ok ? "ok" : "error";
-        } catch (error) {
-            result.textContent = "Ошибка: " + error;
-            result.className = "error";
-        }
-    }
-);
-
-// Запускаем загрузку последовательно при открытии страницы
-async function initApp() {
-    await loadSettings();
-    await loadWidgets();
-    await updateDashboard();
-    await loadMaxSettings();
-    // Следующий запрос запускается только после завершения предыдущего.
-    async function pollDashboard() {
-        await updateDashboard();
-        setTimeout(pollDashboard, 10000);
-    }
-
-    setTimeout(pollDashboard, 10000);
+async function init() {
+  try { await loadSettings(); } catch (_) {}
+  try { await loadWidgets(); } catch (_) {}
+  await updateDashboard();
+  setInterval(updateDashboard, 5000);
 }
-
-initApp();
+init();
 </script>
 </body>
 </html>
 )HTML";
 
-void handleDashboard() {
-    if (isConfigMode) {
-        server.send_P(200, "text/html; charset=utf-8", SETUP_HTML);
-    } else {
-        server.send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
+bool validStateTopic(String topic) {
+    topic.trim();
+
+    if (topic.isEmpty() || topic.length() > MAX_TOPIC_LENGTH) {
+        return false;
     }
+
+    const int hash = topic.indexOf('#');
+
+    String base = hash >= 0 ? topic.substring(0, hash) : topic;
+    base.trim();
+
+    if (base.isEmpty() ||
+        base.indexOf('#') >= 0 ||
+        base.indexOf('+') >= 0) {
+        return false;
+    }
+
+    if (hash >= 0) {
+        String key = topic.substring(hash + 1);
+        key.trim();
+
+        if (key.isEmpty() || key.indexOf('#') >= 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool validCommandTopic(const String& topic) {
+    return !topic.isEmpty() &&
+           topic.length() <= MAX_TOPIC_LENGTH &&
+           topic.indexOf('#') < 0 &&
+           topic.indexOf('+') < 0;
+}
+
+void handleRoot() {
+    server.send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
 }
 
 void handleStatus() {
     JsonDocument doc;
-    doc["ip"] = WiFi.localIP().toString();
-    doc["rssi"] = WiFi.RSSI();
+
+    const String ip = isApMode
+        ? WiFi.softAPIP().toString()
+        : WiFi.localIP().toString();
+
+    doc["ip"] = ip;
+    doc["wifi"] = isApMode || WiFi.status() == WL_CONNECTED;
+    doc["rssi"] = isApMode ? 0 : WiFi.RSSI();
     doc["free_heap"] = ESP.getFreeHeap();
     doc["local_mqtt"] = localMqttClient && localMqttClient->connected();
     doc["main_mqtt"] = mainMqttClient && mainMqttClient->connected();
+    doc["version"] = FIRMWARE_VERSION;
 
-    // Добавляем версию и дату сборки
-    doc["version"] = String("ver. ") + FIRMWARE_VERSION + " (" + __DATE__ + " " + __TIME__ + ")";
-    
     JsonArray states = doc["states"].to<JsonArray>();
-    unsigned long now = millis();
-    
-    if (cachedStates != nullptr) {
-        for (const auto& st : *cachedStates) {
-            JsonObject item = states.add<JsonObject>();
-            item["topic"] = st.topic;
-            item["payload"] = st.payload;
-            item["age_seconds"] = (now - st.updatedAt) / 1000UL;
+    const unsigned long now = millis();
+
+    for (size_t i = 0; i < cachedStateCapacity; ++i) {
+        if (!cachedStates[i].used) {
+            continue;
         }
+
+        JsonObject state = states.add<JsonObject>();
+        state["topic"] = cachedStates[i].topic;
+        state["payload"] = cachedStates[i].payload;
+        state["age_seconds"] =
+            (now - cachedStates[i].updatedAt) / 1000UL;
     }
-    
+
+    String response;
+    response.reserve(4096);
+    serializeJson(doc, response);
+    server.send(200, "application/json; charset=utf-8", response);
+}
+
+void handleGetSettings() {
+    const SystemSettings& s = Settings::get();
+
+    JsonDocument doc;
+    doc["ssid"] = s.wifiSsid;
+    doc["pass"] = s.wifiPassword;
+    doc["host"] = s.mqttHost;
+    doc["port"] = s.mqttPort;
+    doc["user"] = s.mqttUser;
+    doc["pass_mqtt"] = s.mqttPassword;
+
     String response;
     serializeJson(doc, response);
     server.send(200, "application/json; charset=utf-8", response);
 }
 
+void handlePostSettings() {
+    if (!server.hasArg("ssid") ||
+        !server.hasArg("host") ||
+        !server.hasArg("port")) {
+        server.send(400, "text/plain; charset=utf-8", "Не заполнены обязательные поля");
+        return;
+    }
+
+    String host = server.arg("host");
+    host.trim();
+
+    const long port = server.arg("port").toInt();
+
+    if (server.arg("ssid").isEmpty() ||
+        host.isEmpty() ||
+        port < 1 ||
+        port > 65535) {
+        server.send(400, "text/plain; charset=utf-8", "Проверьте SSID, MQTT-хост и порт");
+        return;
+    }
+
+    SystemSettings settings = Settings::get();
+    settings.wifiSsid = server.arg("ssid");
+    settings.wifiPassword = server.arg("pass");
+    settings.mqttHost = host;
+    settings.mqttPort = static_cast<uint16_t>(port);
+    settings.mqttUser = server.arg("user");
+    settings.mqttPassword = server.arg("pass_mqtt");
+
+    if (!Settings::save(settings)) {
+        server.send(500, "text/plain; charset=utf-8", "Не удалось сохранить настройки");
+        return;
+    }
+
+    server.send(200, "text/plain; charset=utf-8", "Настройки сохранены, перезагрузка...");
+    delay(500);
+    ESP.restart();
+}
+
 void handleGetWidgets() {
-    server.send(200, "application/json; charset=utf-8", Settings::widgetsJson());
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        Settings::widgetsJson()
+    );
 }
 
 void handlePostWidgets() {
@@ -1029,7 +646,7 @@ void handlePostWidgets() {
         return;
     }
 
-    JsonDocument doc;
+    DynamicJsonDocument doc(4096);
     DeserializationError error = deserializeJson(doc, body);
 
     if (error || !doc.is<JsonArray>()) {
@@ -1045,258 +662,91 @@ void handlePostWidgets() {
     server.send(200, "text/plain", "OK");
 }
 
-void handleGetSettings() {
-    SystemSettings s = Settings::get();
-    JsonDocument doc;
-    doc["ssid"] = s.wifiSsid;
-    doc["pass"] = s.wifiPassword;
-    doc["host"] = s.mqttHost;
-    doc["port"] = s.mqttPort;
-    doc["user"] = s.mqttUser;
-    doc["pass_mqtt"] = s.mqttPassword;
-    doc["history_enabled"] = Settings::historyEnabled();
-    String response;
-    serializeJson(doc, response);
-    server.send(200, "application/json; charset=utf-8", response);
-}
-
-void handlePostSettings() {
-    if (!server.hasArg("ssid") || !server.hasArg("host")) {
-        server.send(400, "text/plain", "Missing required fields");
-        return;
-    }
-    SystemSettings s = Settings::get();
-    s.wifiSsid = server.arg("ssid");
-    s.wifiPassword = server.arg("pass");
-    s.mqttHost = server.arg("host");
-    s.mqttPort = server.arg("port").toInt();
-    s.mqttUser = server.arg("user");
-    s.mqttPassword = server.arg("pass_mqtt");
-
-    Settings::save(s);
-    server.send(200, "text/plain", "Настройки сохранены! Перезагрузка...");
-    delay(1000);
-    ESP.restart();
-}
-
 void handleCommand() {
     if (!server.hasArg("plain")) {
-        server.send(400, "text/plain", "Missing body");
+        server.send(400, "text/plain; charset=utf-8", "Нет тела запроса");
         return;
     }
-    
+
     JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
+    const DeserializationError error =
+        deserializeJson(doc, server.arg("plain"));
+
     if (error) {
-        server.send(400, "text/plain", "Invalid JSON body");
+        server.send(400, "text/plain; charset=utf-8", "Некорректный JSON");
         return;
     }
 
-    String topic = doc["topic"].as<String>();
-    String payload = doc["payload"].as<String>();
+    String topic = doc["topic"] | "";
+    String payload = doc["payload"] | "";
+    topic.trim();
 
-    if (topic.length() == 0 || payload.length() == 0) {
-        server.send(400, "text/plain", "Missing topic or payload");
+    if (!validCommandTopic(topic) ||
+        payload.length() > MAX_COMMAND_PAYLOAD_LENGTH) {
+        server.send(400, "text/plain; charset=utf-8", "Некорректный топик или слишком длинный payload");
         return;
     }
 
     if (!localMqttClient || !localMqttClient->connected()) {
-        server.send(503, "text/plain", "Local broker not connected");
+        server.send(503, "text/plain; charset=utf-8", "Локальный MQTT-клиент не подключён");
         return;
     }
 
-    if (localMqttClient->publish(topic.c_str(), payload.c_str(), false)) {
-        server.send(200, "text/plain", "Command published successfully");
-    } else {
-        server.send(500, "text/plain", "Failed to publish command");
-    }
-}
+    const bool ok = localMqttClient->publish(
+        topic.c_str(),
+        reinterpret_cast<const uint8_t*>(payload.c_str()),
+        payload.length(),
+        false
+    );
 
-void handleGetMaxSettings() {
-    SystemSettings s = Settings::get();
-    JsonDocument doc;
-    doc["token"] = s.maxToken;
-    doc["userid"] = s.maxUserId;
-    String response;
-    serializeJson(doc, response);
-    server.send(200, "application/json; charset=utf-8", response);
-}
-
-void handlePostMaxSettings() {
-    if (!server.hasArg("token") || !server.hasArg("userid")) {
-        server.send(400, "text/plain", "Missing fields");
-        return;
-    }
-    Settings::saveMax(server.arg("token"), server.arg("userid"));
-    server.send(200, "text/plain", "Настройки MAX успешно сохранены!");
-}
-
-void handleMaxTest() {
-    if (!ENABLE_MAX_NOTIFICATIONS) {
-        server.send(
-            503,
-            "text/plain; charset=utf-8",
-            "MAX временно отключён в прошивке"
-        );
-        return;
-    }
-
-    bool ok = sendMaxNotification("Тестовое уведомление от шлюза ESP32!");
     if (ok) {
-        server.send(200, "text/plain", "Тестовое сообщение успешно отправлено в MAX!");
+        server.send(200, "text/plain; charset=utf-8", "Команда отправлена");
     } else {
-        server.send(500, "text/plain", "Ошибка отправки. Проверьте токен, User ID и интернет на шлюзе.");
+        server.send(500, "text/plain; charset=utf-8", "Ошибка публикации команды");
     }
-}
-
-void handlePostHistorySetting() {
-    if (!server.hasArg("enabled")) {
-        server.send(400, "text/plain; charset=utf-8", "Не указано состояние истории");
-        return;
-    }
-
-    const String value = server.arg("enabled");
-
-    if (value != "0" && value != "1") {
-        server.send(400, "text/plain; charset=utf-8", "Ожидается enabled=0 или enabled=1");
-        return;
-    }
-
-    const bool enabled = value == "1";
-
-    if (!Settings::saveHistoryEnabled(enabled)) {
-        server.send(500, "text/plain; charset=utf-8", "Не удалось сохранить настройку");
-        return;
-    }
-
-    if (!enabled) {
-        clearAllHistory();
-        server.send(
-            200,
-            "text/plain; charset=utf-8",
-            "История отключена, накопленные данные удалены"
-        );
-    } else {
-        server.send(
-            200,
-            "text/plain; charset=utf-8",
-            "История включена"
-        );
-    }
-}
-
-void handleHistory() {
-    if (!Settings::historyEnabled()) {
-        server.send(
-            503,
-            "text/plain; charset=utf-8",
-            "История отключена"
-        );
-        return;
-    }
-
-    if (!server.hasArg("topic")) {
-        server.send(400, "text/plain", "Missing topic");
-        return;
-    }
-
-    String targetTopic = server.arg("topic");
-    targetTopic.trim();
-
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
-
-    const int hashIdx = targetTopic.indexOf('#');
-
-    if (hashIdx >= 0) {
-        // История конкретного поля JSON.
-        String baseTopic = targetTopic.substring(0, hashIdx);
-        String jsonKey = targetTopic.substring(hashIdx + 1);
-
-        baseTopic.trim();
-        jsonKey.trim();
-
-        const String historyTopic = baseTopic + "#" + jsonKey;
-
-        for (const JsonFieldHistory& field : jsonFieldHistories) {
-            if (field.topic != historyTopic || !field.history) {
-                continue;
-            }
-
-            for (size_t i = 0; i < field.historyCount; ++i) {
-                const size_t index =
-                    (field.historyStart + i) % MAX_HISTORY_POINTS;
-
-                const HistoryPoint& pt = field.history[index];
-
-                JsonObject obj = arr.add<JsonObject>();
-                obj["val"] = pt.value;
-                obj["time"] = pt.timestamp;
-            }
-
-            break;
-        }
-    } else if (cachedStates != nullptr) {
-        // История обычного числового MQTT-топика.
-        for (const CachedState& st : *cachedStates) {
-            if (strcmp(st.topic, targetTopic.c_str()) != 0 ||
-                !st.history) {
-                continue;
-            }
-
-            for (size_t i = 0; i < st.historyCount; ++i) {
-                const size_t index =
-                    (st.historyStart + i) % MAX_HISTORY_POINTS;
-
-                const HistoryPoint& pt = st.history[index];
-
-                JsonObject obj = arr.add<JsonObject>();
-                obj["val"] = pt.value;
-                obj["time"] = pt.timestamp;
-            }
-
-            break;
-        }
-    }
-
-    String response;
-    serializeJson(doc, response);
-    server.send(200, "application/json; charset=utf-8", response);
 }
 
 } // namespace
 
 namespace WebDashboard {
-    void begin(PubSubClient& localMqtt, PubSubClient& mainMqtt, std::vector<CachedState>& states, bool apMode) {
-        localMqttClient = &localMqtt;
-        mainMqttClient = &mainMqtt;
-        cachedStates = &states;
-        isConfigMode = apMode;
 
-        ElegantOTA.begin(&server);
-        // Во время загрузки прошивки loop() не выполняется.
-        ElegantOTA.onProgress([](size_t, size_t) {
-            esp_task_wdt_reset();
-        });
+void begin(
+    PubSubClient& localMqtt,
+    PubSubClient& mainMqtt,
+    CachedState* states,
+    size_t stateCapacity,
+    bool apMode
+) {
+    localMqttClient = &localMqtt;
+    mainMqttClient = &mainMqtt;
+    cachedStates = states;
+    cachedStateCapacity = stateCapacity;
+    isApMode = apMode;
 
-
-        server.on("/", HTTP_GET, handleDashboard);
-        server.on("/api/status", HTTP_GET, handleStatus);
-        server.on("/api/widgets", HTTP_GET, handleGetWidgets);
-        server.on("/api/widgets", HTTP_POST, handlePostWidgets);
-        server.on("/api/settings", HTTP_GET, handleGetSettings);
-        server.on("/api/settings", HTTP_POST, handlePostSettings);
-        server.on("/api/command", HTTP_POST, handleCommand);
-        server.on("/api/max-settings", HTTP_GET, handleGetMaxSettings);
-        server.on("/api/max-settings", HTTP_POST, handlePostMaxSettings);
-        server.on("/api/max-test", HTTP_POST, handleMaxTest);
-        server.on("/api/history", HTTP_GET, handleHistory);
-        server.on("/api/history-setting", HTTP_POST, handlePostHistorySetting);
-        server.begin();
+    if (serverStarted) {
+        return;
     }
 
-    void handleClient() {
-        server.handleClient();
-        ElegantOTA.loop();
-    }
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/settings", HTTP_GET, handleGetSettings);
+    server.on("/api/settings", HTTP_POST, handlePostSettings);
+    server.on("/api/widgets", HTTP_GET, handleGetWidgets);
+    server.on("/api/widgets", HTTP_POST, handlePostWidgets);
+    server.on("/api/command", HTTP_POST, handleCommand);
+
+    server.onNotFound([]() {
+        server.send(404, "text/plain; charset=utf-8", "Not found");
+    });
+
+    ElegantOTA.begin(&server);
+    server.begin();
+    serverStarted = true;
 }
+
+void handleClient() {
+    server.handleClient();
+    ElegantOTA.loop();
+}
+
+} // namespace WebDashboard

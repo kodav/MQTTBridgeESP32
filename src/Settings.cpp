@@ -1,109 +1,103 @@
 #include "Settings.h"
 #include "config.h"
+
 #include <Preferences.h>
 
+namespace {
 Preferences preferences;
 SystemSettings currentSettings;
-// По умолчанию сохраняем прежнее поведение.
-static bool historyEnabledValue = true;
-
-namespace Settings {
-const String& widgetsJson() {
-    return currentSettings.widgetsJson;
+String currentWidgetsJson = "[]";
 }
 
+namespace Settings {
+
 void init() {
-    preferences.begin("gateway", false);
+    currentSettings = SystemSettings{};
+    currentSettings.mqttPort = DEFAULT_MQTT_PORT;
+    currentWidgetsJson = "[]";
 
-    currentSettings.configured = preferences.getBool("configured", false);
+    if (!preferences.begin("gateway", true)) {
+        return;
+    }
 
-    currentSettings.wifiSsid = preferences.getString("wifi_ssid", DEFAULT_WIFI_SSID);
-    if (currentSettings.wifiSsid.length() == 0) currentSettings.wifiSsid = DEFAULT_WIFI_SSID;
+    currentSettings.configured =
+        preferences.getBool("configured", false);
 
-    currentSettings.wifiPassword = preferences.getString("wifi_pass", DEFAULT_WIFI_PASSWORD);
-    
-    currentSettings.mqttHost = preferences.getString("mqtt_host", DEFAULT_MQTT_HOST);
-    if (currentSettings.mqttHost.length() == 0) currentSettings.mqttHost = DEFAULT_MQTT_HOST;
+    currentSettings.wifiSsid =
+        preferences.getString("wifi_ssid", DEFAULT_WIFI_SSID);
 
-    currentSettings.mqttPort = preferences.getUShort("mqtt_port", DEFAULT_MQTT_PORT);
-    if (currentSettings.mqttPort == 0) currentSettings.mqttPort = DEFAULT_MQTT_PORT;
+    currentSettings.wifiPassword =
+        preferences.getString("wifi_pass", DEFAULT_WIFI_PASSWORD);
 
-    currentSettings.mqttUser = preferences.getString("mqtt_user", DEFAULT_MQTT_USER);
-    currentSettings.mqttPassword = preferences.getString("mqtt_pass", DEFAULT_MQTT_PASSWORD);
+    currentSettings.mqttHost =
+        preferences.getString("mqtt_host", DEFAULT_MQTT_HOST);
 
-    // Загружаем сохраненные виджеты дашборда
-    currentSettings.widgetsJson = preferences.getString("widgets", "[]");
+    currentSettings.mqttPort =
+        preferences.getUShort("mqtt_port", DEFAULT_MQTT_PORT);
 
-    currentSettings.maxToken = preferences.getString("max_token", DEFAULT_MAX_TOKEN);
-    currentSettings.maxUserId = preferences.getString("max_userid", DEFAULT_MAX_USER_ID);
+    if (currentSettings.mqttPort == 0) {
+        currentSettings.mqttPort = DEFAULT_MQTT_PORT;
+    }
 
-    historyEnabledValue = preferences.getBool("history_on", true);
+    currentSettings.mqttUser =
+        preferences.getString("mqtt_user", DEFAULT_MQTT_USER);
+
+    currentSettings.mqttPassword =
+        preferences.getString("mqtt_pass", DEFAULT_MQTT_PASSWORD);
+
+    currentWidgetsJson =
+        preferences.getString("widgets", "[]");
 
     preferences.end();
 }
 
-SystemSettings get() {
+const SystemSettings& get() {
     return currentSettings;
 }
 
-void save(const SystemSettings& settings) {
-    preferences.begin("gateway", false);
-
-    preferences.putString("wifi_ssid", settings.wifiSsid);
-    preferences.putString("wifi_pass", settings.wifiPassword);
-    
-    preferences.putString("mqtt_host", settings.mqttHost);
-    preferences.putUShort("mqtt_port", settings.mqttPort);
-    preferences.putString("mqtt_user", settings.mqttUser);
-    preferences.putString("mqtt_pass", settings.mqttPassword);
-    preferences.putBool("configured", true);
-
-    preferences.end();
-    
-    currentSettings.wifiSsid = settings.wifiSsid;
-    currentSettings.wifiPassword = settings.wifiPassword;
-    currentSettings.mqttHost = settings.mqttHost;
-    currentSettings.mqttPort = settings.mqttPort;
-    currentSettings.mqttUser = settings.mqttUser;
-    currentSettings.mqttPassword = settings.mqttPassword;
-    currentSettings.configured = true;
+const String& widgetsJson() {
+    return currentWidgetsJson;
 }
 
-void saveWidgets(const String& widgetsJson) {
-    preferences.begin("gateway", false);
-    preferences.putString("widgets", widgetsJson);
-    preferences.end();
-    currentSettings.widgetsJson = widgetsJson;
-}
-
-bool historyEnabled() {
-    return historyEnabledValue;
-}
-
-bool saveHistoryEnabled(bool enabled) {
+bool save(const SystemSettings& settings) {
     if (!preferences.begin("gateway", false)) {
         return false;
     }
 
-    const size_t written = preferences.putBool("history_on", enabled);
+    bool ok = true;
+
+    ok &= preferences.putString("wifi_ssid", settings.wifiSsid) > 0;
+    ok &= preferences.putString("wifi_pass", settings.wifiPassword) > 0;
+    ok &= preferences.putString("mqtt_host", settings.mqttHost) > 0;
+    ok &= preferences.putUShort("mqtt_port", settings.mqttPort) > 0;
+    ok &= preferences.putString("mqtt_user", settings.mqttUser) > 0;
+    ok &= preferences.putString("mqtt_pass", settings.mqttPassword) > 0;
+    ok &= preferences.putBool("configured", true) > 0;
+
     preferences.end();
 
-    if (written != 1) {
+    if (ok) {
+        currentSettings = settings;
+        currentSettings.configured = true;
+    }
+
+    return ok;
+}
+
+bool saveWidgets(const String& json) {
+    if (!preferences.begin("gateway", false)) {
         return false;
     }
 
-    historyEnabledValue = enabled;
-    return true;
-}
-
-// Новая функция сохранения настроек MAX:
-void saveMax(const String& token, const String& userId) {
-    preferences.begin("gateway", false);
-    preferences.putString("max_token", token);
-    preferences.putString("max_userid", userId);
+    const size_t written = preferences.putString("widgets", json);
     preferences.end();
-    currentSettings.maxToken = token;
-    currentSettings.maxUserId = userId;
+
+    if (written == 0) {
+        return false;
+    }
+
+    currentWidgetsJson = json;
+    return true;
 }
 
 } // namespace Settings

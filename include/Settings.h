@@ -1,37 +1,27 @@
 #pragma once
 
 #include <Arduino.h>
+#include <stdint.h>
 
 struct SystemSettings {
     String wifiSsid;
     String wifiPassword;
 
     String mqttHost;
-    uint16_t mqttPort;
+    uint16_t mqttPort = 1883;
 
     String mqttUser;
     String mqttPassword;
 
-    bool configured;
-
-    // Данные виджетов, загруженные из Preferences
-    String widgetsJson;
-
-    String maxToken;
-    String maxUserId; // ID пользователя в MAX
+    bool configured = false;
 };
 
 namespace Settings {
     void init();
-    SystemSettings get();
-    void save(const SystemSettings& settings);
-    void saveWidgets(const String& widgetsJson);
 
-    // Доступ к JSON виджетов без копирования всей структуры
+    const SystemSettings& get();
     const String& widgetsJson();
 
-    // Общий переключатель истории графиков.
-    bool historyEnabled();
-    bool saveHistoryEnabled(bool enabled);
-    void saveMax(const String& token, const String& userId);
+    bool save(const SystemSettings& settings);
+    bool saveWidgets(const String& json);
 }
